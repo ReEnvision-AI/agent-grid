@@ -63,7 +63,7 @@ class OptimizedQwen3MoeAttention(Qwen3MoeAttention):
         cache_position: torch.LongTensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        assert not output_attentions
+        #assert not output_attentions
 
         if position_ids is None:
             past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
@@ -117,7 +117,7 @@ class OptimizedQwen3MoeAttention(Qwen3MoeAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        return attn_output, attn_weights, past_key_value
 
    
 class OptimizedQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
@@ -126,7 +126,7 @@ class OptimizedQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
         self.hidden_size = config.hidden_size
 
-        self._attn_implementation = config._attn_implementation
+        #self._attn_implementation = config._attn_implementation
         self.self_attn = OptimizedQwen3MoeAttention(config, layer_idx)
         self.sliding_window = config.sliding_window
         
@@ -168,7 +168,6 @@ class OptimizedQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
-        output_router_logits: bool | None = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, tuple[torch.Tensor] | None]:
 
         residual = hidden_states
@@ -239,32 +238,6 @@ class WrappedQwen3MoeBlock(OptimizedQwen3MoeDecoderLayer):
             seq_length_with_past = seq_length_with_past + past_key_values_length
             past_key_value = self._reorder_cache_from_bloom(past_key_value, batch_size, past_key_values_length)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values_length if past_key_value is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
-            )
-        if self._attn_implementation == "flash_attention_2":
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._attn_implementation == "sdpa":
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-            )
-        else:
-            # 4d mask is passed through the layers
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-                sliding_window=self.sliding_window,
-            )
 
         outputs = super().forward(
             hidden_states,
@@ -312,73 +285,5 @@ class WrappedQwen3MoeBlock(OptimizedQwen3MoeDecoderLayer):
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
         return (key_states, value_states)
-    
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_value: tuple[torch.Tensor],
-        device: str,
-        output_attentions: bool | None = False,
-    ):
-        past_seen_tokens = past_key_value[0].shape[-2] if past_key_value is not None else 0
-        dtype = input_tensor.dtype
-        sequence_length = input_tensor.shape[1]
 
-        target_length = (
-            attention_mask.shape[-1]
-            if isinstance(attention_mask, torch.Tensor)
-            else past_seen_tokens + sequence_length + 1
-        )
-
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            cache_position=cache_position,
-            batch_size = input_tensor.shape[0],
-            device=device
-        )
-
-        return causal_mask
-    
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        device: str,
-    ):
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-            )
-            diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(
-                -1, 1
-            )
-            causal_mask *= diagonal_attend_mask
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                if attention_mask.shape[-1] > target_length:
-                    attention_mask = attention_mask[:, :target_length]
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-
-        return causal_mask
     
