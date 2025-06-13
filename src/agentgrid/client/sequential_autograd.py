@@ -227,7 +227,7 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs: torch.Tensor, prompts: torch.Tensor, sequence_manager: RemoteSequenceManager):
+    def forward(ctx, inputs: torch.Tensor, prompts: torch.Tensor, attention_mask: torch.Tensor, sequence_manager: RemoteSequenceManager):
         batch_size = max(MAX_TOKENS_IN_BATCH // inputs.shape[1], 1)
         input_batches: Sequence[torch.Tensor] = inputs.detach().split(batch_size)
         if prompts is None or is_dummy(prompts):
@@ -247,6 +247,7 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
         ctx.sequence_manager = sequence_manager
         ctx.intemediate_input_batches = intemediate_input_batches
         ctx.sequences_for_batches = sequences_for_batches
+        ctx.attention_mask = attention_mask
         return torch.cat(output_batches, dim=0)
 
     @staticmethod

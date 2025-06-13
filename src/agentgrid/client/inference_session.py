@@ -4,7 +4,7 @@ import asyncio
 import itertools
 import time
 import uuid
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import AsyncIterator, List, Optional, Tuple, Union
 
 import torch
 from hivemind import MSGPackSerializer, anext, deserialize_torch_tensor, get_logger, serialize_torch_tensor
@@ -99,6 +99,7 @@ class _ServerInferenceSession:
         inputs: torch.Tensor,
         prompts: torch.Tensor,
         hypo_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -126,7 +127,7 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
+        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, attention_mask)
 
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
@@ -145,17 +146,13 @@ class _ServerInferenceSession:
         compression = server_side_inference_schema[0].compression
         inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
 
-        # TODO: create more explicit way to check servers schema and client's structure
-        assert len(input_tensors) >= len(
-            server_side_inference_schema
-        ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
         outputs_serialized = RemoteExpertWorker.run_coroutine(
             self._step(
                 runtime_pb2.ExpertRequest(
                     uid=self.uid,
                     tensors=[
-                        serialize_torch_tensor(tensor.to(proto.dtype), proto.compression)
+                        serialize_torch_tensor(tensor.to(proto.dtype).cpu(), proto.compression)
                         for tensor, proto in zip(input_tensors, inference_schema)
                     ],
                     metadata=MSGPackSerializer.dumps(request_metadata),
@@ -286,6 +283,7 @@ class InferenceSession:
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
         hypo_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -318,6 +316,10 @@ class InferenceSession:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"
             )
+        
+        if attention_mask is None:
+            seq_length_with_past = self._position + n_input_tokens
+            attention_mask = torch.ones((inputs.shape[0], seq_length_with_past), device=inputs.device)
 
         server_idx = 0
         block_idx = 0
@@ -335,6 +337,7 @@ class InferenceSession:
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
+                        attention_mask,
                         step_id=step_id,
                     )
 

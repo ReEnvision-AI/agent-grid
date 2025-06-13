@@ -1,8 +1,10 @@
 import math
+from typing import Callable
 
 import torch
 import torch.nn as nn
 
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
@@ -12,6 +14,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
     rotate_half, 
     eager_attention_forward)
+
+from agentgrid.utils.cuda_graphs import make_inference_graphed_callable
 
 from hivemind import get_logger
 
@@ -29,6 +33,13 @@ class OptimizedQwen3Attention(Qwen3Attention):
         self._rotary_graph = None
         self.rotary_emb = Qwen3RotaryEmbedding(config=self.config)
 
+    def _optimized_apply_rotary(self, query_states, key_states, cos, sin):
+        if self._rotary_graph is None:
+            self._rotary_graph = make_inference_graphed_callable(
+                apply_rotary_pos_emb, sample_args=(query_states, key_states, cos, sin)
+            )
+        return self._rotary_graph(query_states, key_states, cos, sin)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -40,7 +51,7 @@ class OptimizedQwen3Attention(Qwen3Attention):
         cache_position: torch.LongTensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        assert not output_attentions
+        _, q_len, _ = hidden_states.shape
 
         if position_ids is None:
             past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
@@ -55,8 +66,12 @@ class OptimizedQwen3Attention(Qwen3Attention):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids) # different than Qwen3Attention
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        cos, sin = self.rotary_emb(value_states, position_ids) 
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        if q_len == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
+            query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
+        else:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -65,7 +80,17 @@ class OptimizedQwen3Attention(Qwen3Attention):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        attn_output, _ = eager_attention_forward(
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                logger.warning_once(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
@@ -73,13 +98,13 @@ class OptimizedQwen3Attention(Qwen3Attention):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs
+            sliding_window=None,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return (attn_output, None, past_key_value)
+        return (attn_output, attn_weights, past_key_value)
     
 class OptimizedQwen3DecoderLayer(Qwen3DecoderLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
@@ -93,6 +118,23 @@ class OptimizedQwen3DecoderLayer(Qwen3DecoderLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.config = config
 
+        self.pre_attn_graph = None
+        self.post_attn_graph = None
+
+    def _optimized_input_layernorm(self, hidden_states):
+        if self.pre_attn_graph is None:
+            self.pre_attn_graph = make_inference_graphed_callable(
+                self.input_layernorm.forward, sample_args=(hidden_states,)
+            )
+        return self.pre_attn_graph(hidden_states)
+    
+    def _optimized_output_layernorm(self, hidden_states):
+        if self.post_attn_graph is None:
+            self.post_attn_graph = make_inference_graphed_callable(
+                self.post_attention_layernorm.forward, sample_args=(hidden_states,)
+            )
+        return self.post_attn_graph(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -105,7 +147,10 @@ class OptimizedQwen3DecoderLayer(Qwen3DecoderLayer):
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if hidden_states.size(1) == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
+            hidden_states = self._optimized_input_layernorm(hidden_states)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -122,7 +167,10 @@ class OptimizedQwen3DecoderLayer(Qwen3DecoderLayer):
         # Fully Connected
         residual = hidden_states
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if hidden_states.size(1) == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
+            hidden_states = self._optimized_output_layernorm(hidden_states)
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
@@ -162,20 +210,6 @@ class WrappedQwen3Block(OptimizedQwen3DecoderLayer):
             seq_length_with_past = seq_length_with_past + past_key_values_length
             past_key_value = self._reorder_cache_from_bloom(past_key_value, batch_size, past_key_values_length)
 
-        if cache_position is None:
-            cache_position = torch.arange(
-                past_key_values_length, past_key_values_length + hidden_states.shape[1], device=hidden_states.device
-            )
-
-
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
-            )
-
-        attention_mask = self._update_causal_mask(
-            attention_mask, hidden_states, cache_position, past_key_value, output_attentions=False, device=hidden_states.device
-        )
 
         outputs = super().forward(
             hidden_states,

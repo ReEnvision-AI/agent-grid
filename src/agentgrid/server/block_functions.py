@@ -172,7 +172,7 @@ async def iterate_rpc_inference(
             # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, prompts, hypo_ids, *_ = flat_tensors
+        hidden_states, prompts, hypo_ids, attention_mask, *_ = flat_tensors
         batch_size, length_increment, _ = hidden_states.shape
 
         # Cast inputs to backend dtype
@@ -216,13 +216,13 @@ async def iterate_rpc_inference(
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
-                    hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
+                    hidden_states, hypo_ids, attention_mask, inference_infos, *prompts, priority=priority
                 )
             else:
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
-                        hidden_states, hypo_ids, inference_infos, prompt, priority=priority
+                        hidden_states, hypo_ids, attention_mask, inference_infos, prompt, priority=priority
                     )
 
         # serialize and send last layer outputs

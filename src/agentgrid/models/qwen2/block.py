@@ -1,4 +1,5 @@
 import math
+from typing import Callable
 
 from hivemind import get_logger
 
@@ -6,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
@@ -15,7 +17,8 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2RMSNorm,
     Qwen2RotaryEmbedding,
     repeat_kv,
-    rotate_half
+    rotate_half,
+    eager_attention_forward
 )
 
 from agentgrid.utils.cuda_graphs import make_inference_graphed_callable
@@ -55,18 +58,14 @@ class OptimizedQwen2Attention(Qwen2Attention):
             position_ids = torch.arange(
                 past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
             ).unsqueeze(0)
-        bsz, q_len, _ = hidden_states.shape
+        _, q_len, _ = hidden_states.shape
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
@@ -83,26 +82,31 @@ class OptimizedQwen2Attention(Qwen2Attention):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                logger.warning_once(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,
+            **kwargs,
+        )
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size)
-
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
+        return attn_output, attn_weights, past_key_value
     
 class OptimizedQwen2DecoderLayer(Qwen2DecoderLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
@@ -207,17 +211,6 @@ class WrappedQwen2Block(OptimizedQwen2DecoderLayer):
 
         assert position_ids is None
 
-        # embed positions
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
-            )
-        attention_mask = _prepare_4d_causal_attention_mask(
-            attention_mask=attention_mask,
-            input_shape=(batch_size, seq_length),
-            inputs_embeds=hidden_states,
-            past_key_values_length=past_key_values_length,
-        )
 
         outputs = super().forward(
             hidden_states,

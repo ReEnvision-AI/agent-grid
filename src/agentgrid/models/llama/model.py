@@ -59,10 +59,6 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        # The causal mask will be added on the server-side
-        assert (
-            attention_mask is None or (attention_mask == 1).all()
-        ), f"Custom attention masks are not supported, {attention_mask=}"
         if cache_position is not None:
             assert position_ids is not None and torch.all(torch.eq(cache_position, position_ids)).item()
         assert (
@@ -87,9 +83,14 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         hidden_states = inputs_embeds
         output_shape = input_shape + (hidden_states.size(-1),)
 
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
+
         hidden_states = self.layers(
             hidden_states,
             prompts=intermediate_prompts,
+            attention_mask=causal_mask,
             hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
         )
 
