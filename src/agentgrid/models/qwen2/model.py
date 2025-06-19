@@ -84,6 +84,8 @@ class DistributedQwen2Model(FromPretrainedMixin, PTuneMixin, Qwen2Model):
         )
 
         hidden_states = inputs_embeds
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = (hidden_states, ) if output_hidden_states else None
 
@@ -91,7 +93,8 @@ class DistributedQwen2Model(FromPretrainedMixin, PTuneMixin, Qwen2Model):
             hidden_states,
             prompts=None,
             attention_mask=causal_mask,
-            hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
         )
 
         past_key_values.update_seen(hidden_states.size(1))

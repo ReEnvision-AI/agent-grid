@@ -98,8 +98,9 @@ class _ServerInferenceSession:
         self,
         inputs: torch.Tensor,
         prompts: torch.Tensor,
-        hypo_ids: torch.LongTensor,
         attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -127,7 +128,7 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, attention_mask)
+        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, attention_mask, position_ids, position_embeddings)
 
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
@@ -282,8 +283,10 @@ class InferenceSession:
         self,
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
-        hypo_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -298,18 +301,18 @@ class InferenceSession:
             assert prompts.shape[2] <= inputs.shape[1]
             assert prompts.shape[3] == inputs.shape[2]
 
-        if hypo_ids is None or is_dummy(hypo_ids):
-            hypo_ids = DUMMY_INT64
-        else:
-            assert len(hypo_ids) == len(inputs)
-            assert hypo_ids.dtype == torch.int64
 
         inputs_device = inputs.device
         inputs_dtype = inputs.dtype
         inputs = inputs.cpu()
         prompts = prompts.cpu()
-        hypo_ids = hypo_ids.cpu()
         step_id = str(uuid.uuid4())
+        if position_embeddings:
+            cos, sin = position_embeddings
+            cos = cos.cpu()
+            sin = sin.cpu()
+            position_embeddings = (cos, sin)
+        position_ids = position_ids.cpu()
 
         n_input_tokens = inputs.shape[1]
         if self._position + n_input_tokens > self._max_length:
@@ -319,7 +322,7 @@ class InferenceSession:
         
         if attention_mask is None:
             seq_length_with_past = self._position + n_input_tokens
-            attention_mask = torch.ones((inputs.shape[0], seq_length_with_past), device=inputs.device)
+            attention_mask = torch.ones((inputs.shape[0], seq_length_with_past), device='cpu')
 
         server_idx = 0
         block_idx = 0
@@ -336,8 +339,9 @@ class InferenceSession:
                     inputs = server_session.step(
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
-                        hypo_ids,
-                        attention_mask,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
                         step_id=step_id,
                     )
 

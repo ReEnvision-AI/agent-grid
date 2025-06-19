@@ -23,7 +23,6 @@ class RemotePastKeyValues(Cache):
     def __init__(self) -> None:
         super().__init__()
         self._seen_tokens = 0
-        self.hypo_ids: Optional[torch.LongTensor] = None
 
     def __getitem__(self, _index: int) -> List[torch.Tensor]:
         return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()

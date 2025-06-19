@@ -51,6 +51,7 @@ class OptimizedQwen2Attention(Qwen2Attention):
         past_key_value: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         if position_ids is None:
@@ -67,8 +68,12 @@ class OptimizedQwen2Attention(Qwen2Attention):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        if position_embeddings:
+            assert isinstance(position_embeddings, tuple), "expected position_embeddings to be a tuple"
+            cos, sin = position_embeddings
+        else:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
         if q_len == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
             query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
@@ -112,7 +117,7 @@ class OptimizedQwen2DecoderLayer(Qwen2DecoderLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
-        self.self_attn = OptimizedQwen2Attention(config=config, layer_idx=0)
+        self.self_attn = OptimizedQwen2Attention(config=config, layer_idx=layer_idx)
 
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -144,6 +149,7 @@ class OptimizedQwen2DecoderLayer(Qwen2DecoderLayer):
         output_attentions: bool | None= False,
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs 
     ):
         residual = hidden_states
@@ -162,6 +168,7 @@ class OptimizedQwen2DecoderLayer(Qwen2DecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -196,6 +203,7 @@ class WrappedQwen2Block(OptimizedQwen2DecoderLayer):
         position_ids: torch.LongTensor | None = None,
         layer_past: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         batch_size, seq_length, _ = hidden_states.shape
@@ -209,9 +217,6 @@ class WrappedQwen2Block(OptimizedQwen2DecoderLayer):
             seq_length_with_past = seq_length_with_past + past_key_values_length
             past_key_value = self._reorder_cache_from_bloom_to_llama(past_key_value, batch_size, past_key_values_length)
 
-        assert position_ids is None
-
-
         outputs = super().forward(
             hidden_states,
             *args,
@@ -219,6 +224,7 @@ class WrappedQwen2Block(OptimizedQwen2DecoderLayer):
             position_ids=position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
 

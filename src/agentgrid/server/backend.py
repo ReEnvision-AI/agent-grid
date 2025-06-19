@@ -83,9 +83,11 @@ class TransformerBackend(ModuleBackend):
         self.inference_schema = (
             (
                 *self.args_schema,
-                BatchTensorDescriptor((), dtype=self.dtype),
-                BatchTensorDescriptor((), dtype=torch.int64),
-                BatchTensorDescriptor((), dtype=self.dtype)
+                BatchTensorDescriptor((), dtype=self.dtype), # Inputs
+                BatchTensorDescriptor((), dtype=self.dtype), # Prompts
+                BatchTensorDescriptor((), dtype=self.dtype), # Attention Mask
+                BatchTensorDescriptor((), dtype=self.dtype), # Position IDs
+                (BatchTensorDescriptor((), dtype=self.dtype), BatchTensorDescriptor((), dtype=self.dtype)), # Position Embeddings
             ),
             self.kwargs_schema,
         )
@@ -121,17 +123,19 @@ class TransformerBackend(ModuleBackend):
     def inference_step(
         self,
         hidden_states: torch.Tensor,
-        hypo_ids: torch.LongTensor,
         attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         inference_info: InferenceMetadata,
     ) -> Tuple[torch.Tensor, ...]:
         assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]"
+        
+        assert isinstance(position_embeddings, tuple), "expected position_embeddings to be a tuple"
         seq_len = hidden_states.shape[1]
 
         with self.memory_cache.use_cache(
             *inference_info.cache_handles
         ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter):
-            self._reorder_cache_inplace(cache_tensors, hypo_ids)
 
             # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
             # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
@@ -142,7 +146,7 @@ class TransformerBackend(ModuleBackend):
             for offset in range(0, seq_len, max_chunk_length):
                 hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :]
                 output_hidden_states_chunk, new_kvs = self.module.forward(
-                    hidden_states_chunk, layer_past=layer_past, use_cache=True, attention_mask=attention_mask,
+                    hidden_states_chunk, layer_past=layer_past, use_cache=True, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings
                 )
                 if seq_len > max_chunk_length:
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
@@ -231,17 +235,21 @@ class _MergedInferenceStep:
     def __call__(
         self,
         hidden_states: torch.Tensor,
-        hypo_ids: torch.LongTensor,
         attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         inference_infos: Sequence[InferenceMetadata],
         *optional_prompts: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, ...]:
         assert len(inference_infos) == len(
             optional_prompts
         ), f"found {len(inference_infos)} blocks but {len(optional_prompts)} prompts"
+
+        assert isinstance(position_embeddings, tuple), "expected position_embeddings to be a tuple"
+
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
                 hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
-            outputs = self.backends[inference_info.uid].inference_step(hidden_states, hypo_ids, attention_mask, inference_info)
+            outputs = self.backends[inference_info.uid].inference_step(hidden_states, attention_mask, position_ids, position_embeddings, inference_info)
             hidden_states = outputs[0]
         return (hidden_states,)

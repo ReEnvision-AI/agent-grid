@@ -15,7 +15,7 @@ if not cr_user:
     raise ValueError("CR_USER is not set")
 
 # Define the version for the Docker Image
-version = os.getenv("AGENT_GRID_VERSION", "2.3.2")
+version = os.getenv("AGENT_GRID_VERSION", "1.1.0")
 print(f"Building Agent Grid container version {version}")
 
 # Login to Github Container Registry using podman

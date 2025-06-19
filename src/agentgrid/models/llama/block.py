@@ -52,6 +52,7 @@ class OptimizedLlamaAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         assert not output_attentions
         if position_ids is None:
@@ -88,8 +89,11 @@ class OptimizedLlamaAttention(LlamaAttention):
         key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+        else:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
         if q_len == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
             query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
@@ -165,6 +169,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -197,6 +202,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
 
@@ -233,6 +239,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         batch_size, seq_length, _ = hidden_states.shape
@@ -246,7 +253,6 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             seq_length_with_past = seq_length_with_past + past_key_values_length
             past_key_value = self._reorder_cache_from_bloom_to_llama(past_key_value, batch_size, past_key_values_length)
 
-        assert position_ids is None
 
         outputs = super().forward(
             hidden_states,
@@ -255,6 +261,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             position_ids=position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
 

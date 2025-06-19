@@ -26,9 +26,13 @@ MAX_TOKENS_IN_BATCH = 1024
 async def sequential_forward(
     inputs: torch.Tensor,
     prompts: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     sequence_manager: RemoteSequenceManager,
     start_index: int = 0,
     end_index: Optional[int] = None,
+    **kwargs,
 ) -> Tuple[torch.Tensor, Sequence[torch.Tensor], Sequence[RemoteSpanInfo]]:
     """
     Constructs a routing path from <start_index> to <end_index>.
@@ -42,6 +46,12 @@ async def sequential_forward(
     inputs_dtype = inputs.dtype
     inputs = inputs.cpu()
     prompts = prompts.cpu()
+    attention_mask = attention_mask.cpu()
+    position_ids = position_ids.cpu()
+    cos, sin = position_embeddings
+    cos = cos.cpu().detach()
+    sin = sin.cpu().detach()
+    position_embeddings = (cos, sin)
 
     end_index = end_index if end_index is not None else len(sequence_manager.block_uids)
     assert start_index >= 0 and end_index <= len(sequence_manager.block_uids)
@@ -68,7 +78,7 @@ async def sequential_forward(
                 span = sequences.popleft()
 
                 stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
-                flat_tensors, args_structure = pack_args_kwargs(inputs, prompts[span.start : span.end])
+                flat_tensors, args_structure = pack_args_kwargs(inputs, prompts[span.start : span.end], attention_mask, position_ids, position_embeddings, **kwargs)
 
                 span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
                 metadata = sequence_manager.get_request_metadata(
@@ -196,11 +206,11 @@ async def sequential_backward(
     return grad_outputs, grad_prompts
 
 
-async def _gather_forward(input_batches, prompt_batches, sequence_manager):
+async def _gather_forward(input_batches, prompt_batches, attention_mask, position_ids, position_embeddings, sequence_manager):
     """Wrapper for asyncio.gather to perform parallel sequential forwards"""
     return await asyncio.gather(
         *[
-            sequential_forward(input_batch, prompt_batch, sequence_manager)
+            sequential_forward(input_batch, prompt_batch, attention_mask, position_ids, position_embeddings, sequence_manager)
             for input_batch, prompt_batch in zip(input_batches, prompt_batches)
         ]
     )
@@ -227,7 +237,7 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs: torch.Tensor, prompts: torch.Tensor, attention_mask: torch.Tensor, sequence_manager: RemoteSequenceManager):
+    def forward(ctx, inputs: torch.Tensor, prompts: torch.Tensor, attention_mask: torch.Tensor, position_ids: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor], sequence_manager: RemoteSequenceManager, kwargs: dict):
         batch_size = max(MAX_TOKENS_IN_BATCH // inputs.shape[1], 1)
         input_batches: Sequence[torch.Tensor] = inputs.detach().split(batch_size)
         if prompts is None or is_dummy(prompts):
@@ -236,7 +246,7 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
             prompt_batches: Sequence[torch.Tensor] = prompts.detach().split(batch_size, dim=1)
 
         sequence_manager.rpc_info  # lazy init
-        outputs = RemoteExpertWorker.run_coroutine(_gather_forward(input_batches, prompt_batches, sequence_manager))
+        outputs = RemoteExpertWorker.run_coroutine(_gather_forward(input_batches, prompt_batches, attention_mask, position_ids, position_embeddings, sequence_manager, **kwargs))
         assert len(outputs) == len(input_batches)
 
         output_batches = [output[0] for output in outputs]
@@ -248,6 +258,8 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
         ctx.intemediate_input_batches = intemediate_input_batches
         ctx.sequences_for_batches = sequences_for_batches
         ctx.attention_mask = attention_mask
+        ctx.position_ids = position_ids
+        ctx.position_embeddings = position_embeddings
         return torch.cat(output_batches, dim=0)
 
     @staticmethod

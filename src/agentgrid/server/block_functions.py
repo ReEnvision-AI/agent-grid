@@ -46,9 +46,14 @@ async def run_rpc_forward(
     :returns: hidden states after the last layer [batch_size, seq_length, hid_size]
     """
     if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-        flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
-    hidden_states, prompts, *_ = flat_tensors
+        unpacked_args, unpacked_kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+    else:
+        unpacked_args, unpacked_kwargs = flat_tensors, {}
+    hidden_states = unpacked_args[0]
+    prompts = unpacked_args[1]
+    attention_mask = unpacked_args[2]
+    position_ids = unpacked_args[3]
+    position_embeddings = unpacked_args[4]
 
     dtype = requested_backends[0].dtype
     # check parse input tensors and cast dtypes
@@ -70,6 +75,10 @@ async def run_rpc_forward(
         )
         (hidden_states,) = await backend.forward_pool.submit_task(
             hidden_states,
+            attention_mask,
+            position_ids,
+            position_embeddings,
+            *unpacked_kwargs.values(),
             active_adapter,
             priority=priority,
         )
@@ -172,12 +181,15 @@ async def iterate_rpc_inference(
             # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, prompts, hypo_ids, attention_mask, *_ = flat_tensors
+        hidden_states = flat_tensors[0]
+        prompts = flat_tensors[1]
+        attention_mask = flat_tensors[2]
+        position_ids = flat_tensors[3]
+        position_embeddings = flat_tensors[4]
         batch_size, length_increment, _ = hidden_states.shape
 
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
-        assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -200,7 +212,6 @@ async def iterate_rpc_inference(
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
         priority = prioritizer.prioritize(
             hidden_states,
-            hypo_ids,
             points=point_per_piece,
             requested_uids=requested_uids,
             type="inference",
@@ -216,13 +227,13 @@ async def iterate_rpc_inference(
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
-                    hidden_states, hypo_ids, attention_mask, inference_infos, *prompts, priority=priority
+                    hidden_states, attention_mask, position_ids, position_embeddings, inference_infos, *prompts, priority=priority
                 )
             else:
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
-                        hidden_states, hypo_ids, attention_mask, inference_infos, prompt, priority=priority
+                        hidden_states, attention_mask, position_ids, position_embeddings, inference_infos, prompt, priority=priority
                     )
 
         # serialize and send last layer outputs

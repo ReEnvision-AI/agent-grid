@@ -61,9 +61,6 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
 
         if cache_position is not None:
             assert position_ids is not None and torch.all(torch.eq(cache_position, position_ids)).item()
-        assert (
-            position_ids is None or (position_ids[:, 1:] - position_ids[:, :-1] == 1).all()
-        ), f"Non-consecutive position_ids are not supported, {position_ids=}"
         assert use_cache is None or use_cache, f"{use_cache=} is not supported"
         assert not output_attentions, f"{output_attentions=} is not supported"
         assert not output_hidden_states, f"{output_hidden_states=} is not supported"
@@ -72,39 +69,40 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        use_prompts = self.config.tuning_mode and "ptune" in self.config.tuning_mode and self.layers.position == 0
-        if use_prompts:
-            batch_size = inputs_embeds.shape[0]
-            prompts, intermediate_prompts = self.get_prompt(batch_size)
-            inputs_embeds = torch.cat([prompts, inputs_embeds], dim=1)
-        else:
-            prompts = intermediate_prompts = None
+        if use_cache and past_key_values is None:
+            past_key_values = RemotePastKeyValues()
 
-        hidden_states = inputs_embeds
-        output_shape = input_shape + (hidden_states.size(-1),)
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
 
+        hidden_states = inputs_embeds
+
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         hidden_states = self.layers(
             hidden_states,
-            prompts=intermediate_prompts,
+            prompts=None,
             attention_mask=causal_mask,
-            hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
         )
 
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
         past_key_values.update_seen(hidden_states.size(1))
 
-        # Remove prefix
-        if use_prompts:
-            hidden_states = hidden_states[:, self.pre_seq_len :]
-
         # Add last hidden state
         hidden_states = self.norm(hidden_states)
-        hidden_states = hidden_states.view(output_shape)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,

@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Enable job contro
+set -m
+
+cleanup() {
+    echo "Shutting down the server and its child processes..."
+    kill -- -"$PYTHON_PID"
+    echo "Cleanup complete"
+}
+
 # Check if .env file exists
 if [ ! -f ".env" ]; then
     echo "Error: .env file not found. Please create a .env file with required variables."
@@ -23,7 +32,7 @@ done
 # Get user selection
 while true; do
     read -p "Enter the number of your choice (1-${#MODELS[@]}): " choice
-    if [[ "$choice" =~ ^[1-9]$ ]]; then
+    if [[ "$choice" =~ ^[1-9][0-9]*$ && "$choice" -le "${#MODELS[@]}" ]]; then
         MODEL=${MODELS[$((choice-1))]}
         break
     else
@@ -36,15 +45,16 @@ PORT=31331
 MAX_LENGTH=136192
 ALLOC_TIMEOUT=6000
 ATTN_CACHE_TOKENS=128000
-#ATTN_CACHE_TOKENS=32768
 PUBLIC_IP=$(curl ipinfo.io/ip)
 P2P_FILE='./dev.id'
 DISK_SPACE='120GB'
 INFERENCE_MAX_LENGTH=40960
-#ACCELERATE_INIT_INCLUDE_BUFFERS=FALSE
 MAX_CHUNK_SIZE_BYTES=1073741824
 
 source .env
+
+# Set a trap to call the cleanup function upon receiving SIGINT (Ctrl+C)
+trap cleanup SIGINT SIGTERM EXIT
 
 python -m agentgrid.cli.run_server \
     --max_disk_space $DISK_SPACE \
@@ -60,4 +70,10 @@ python -m agentgrid.cli.run_server \
     --identity_path $P2P_FILE \
     --throughput 'eval' \
     --new_swarm \
-    $MODEL
+    $MODEL &
+
+PYTHON_PID=$!
+
+echo "Server started with PID: $PYTHON_PID. Press Ctrl+C to stop."
+
+wait $PYTHON_PID

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Generator, Optional, Union
+from typing import Generator, Optional, Tuple, Union
 
 import torch
 from hivemind import DHT, get_logger
@@ -49,13 +49,12 @@ class RemoteSequential(nn.Module):
 
         self._active_session = ContextVar("active_session", default=None)
 
-    def forward(self, inputs: torch.Tensor, prompts: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, prompts: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None, position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, **kwargs) -> torch.Tensor:
         assert inputs.ndim == 3, "inputs must be a tensor of shape [batch_size, seq_length, hidden_size]"
         if self.active_session is None:
-            assert all(v is None for v in kwargs.values()), f"Extra kwargs are not supported in forward: {kwargs}"
-            return _RemoteSequentialAutogradFunction.apply(inputs, prompts, attention_mask, self.sequence_manager)
+            return _RemoteSequentialAutogradFunction.apply(inputs, prompts, attention_mask, position_ids, position_embeddings, self.sequence_manager, kwargs)
         else:
-            return self.active_session.step(inputs, prompts, attention_mask=attention_mask, **kwargs)
+            return self.active_session.step(inputs, prompts, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings, **kwargs)
 
     @property
     def active_session(self) -> Optional[InferenceSession]:

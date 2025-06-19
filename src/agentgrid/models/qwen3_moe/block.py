@@ -61,6 +61,7 @@ class OptimizedQwen3MoeAttention(Qwen3MoeAttention):
         output_attentions: bool | None = False,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         #assert not output_attentions
@@ -78,8 +79,11 @@ class OptimizedQwen3MoeAttention(Qwen3MoeAttention):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+        else:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
         if hidden_states.size(1) == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
             query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
@@ -168,6 +172,7 @@ class OptimizedQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, tuple[torch.Tensor] | None]:
 
         residual = hidden_states
@@ -185,6 +190,7 @@ class OptimizedQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
         hidden_states = residual + hidden_states
 
@@ -224,6 +230,7 @@ class WrappedQwen3MoeBlock(OptimizedQwen3MoeDecoderLayer):
         layer_past: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         
@@ -246,6 +253,8 @@ class WrappedQwen3MoeBlock(OptimizedQwen3MoeDecoderLayer):
             position_ids=position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs
         )
 
