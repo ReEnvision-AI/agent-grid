@@ -4,7 +4,6 @@ import torch
 from accelerate import init_empty_weights
 from transformers import PretrainedConfig, PreTrainedModel
 
-from agentgrid.models.mixtral.block import WrappedMixtralBlock
 from agentgrid.models.qwen2.block import WrappedQwen2Block
 from agentgrid.models.qwen3_moe.block import WrappedQwen3MoeBlock
 from agentgrid.models.qwen3.block import WrappedQwen3Block
@@ -62,9 +61,6 @@ def get_model_block(config, layer_idx: int = 0):
     kwargs argument **only** is necessary for specific classes, like Mixtral.
     They will not be passed to other block constructors.
     """
-    if config.block_class == WrappedMixtralBlock:
-        config = PreTrainedModel._autoset_attn_implementation(config)
-        return config.block_class(config, layer_idx)
     if config.block_class == WrappedQwen2Block or config.block_class == WrappedQwen3MoeBlock:
         return config.block_class(config, layer_idx)
     if config.block_class == WrappedQwen3Block:

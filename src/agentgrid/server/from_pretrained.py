@@ -24,7 +24,6 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.utils.hub import cached_file
 
 from agentgrid.constants import DTYPE_MAP
-from agentgrid.models.mixtral import WrappedMixtralBlock
 from agentgrid.server.block_utils import get_model_block, resolve_block_dtype
 from agentgrid.utils.auto_config import AutoDistributedConfig
 from agentgrid.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
