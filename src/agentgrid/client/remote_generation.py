@@ -7,7 +7,7 @@ import torch
 import transformers
 from hivemind.utils.logging import get_logger
 from torch import Tensor
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache
 from transformers.generation.utils import ModelOutput
 
 from agentgrid.client.inference_session import InferenceSession
@@ -25,7 +25,7 @@ class RemotePastKeyValues(Cache):
         self._seen_tokens = 0
 
     def __getitem__(self, _index: int) -> List[torch.Tensor]:
-        return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()
+        return [DUMMY]
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         return self._seen_tokens
@@ -95,7 +95,6 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             context_manager = contextlib.nullcontext(self.active_session)
         else:
             # If there's no active session, create a new one
-
             max_length = kwargs.get("max_length")
             max_new_tokens = kwargs.get("max_new_tokens")
             assert (max_length is None) != (
@@ -153,7 +152,3 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         if "max_length" in kwargs and kwargs["max_length"] is None:
             del kwargs["max_length"]
 
-
-    @staticmethod
-    def _reorder_cache(past_key_values: RemotePastKeyValues, beam_idx: torch.LongTensor) -> RemotePastKeyValues:
-        return dataclasses.replace(past_key_values, hypo_ids=beam_idx)
