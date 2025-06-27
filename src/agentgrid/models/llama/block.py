@@ -50,12 +50,13 @@ def eager_attention_forward(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None and attention_mask.ndim == 4:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-    elif attention_mask.ndim == 2:
-        causal_mask = attention_mask[: key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+    if attention_mask is not None: 
+        if attention_mask.ndim == 4:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+        elif attention_mask.ndim == 2:
+            causal_mask = attention_mask[: key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
