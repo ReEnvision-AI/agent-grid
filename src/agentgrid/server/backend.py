@@ -65,29 +65,47 @@ class TransformerBackend(ModuleBackend):
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
         self.shard_num_heads = []
+        self.shard_num_kv_heads = []
         self.shard_head_dims = []
-        shard_idx = 0
         for shard in self.module.module_shards:
+            num_heads_on_shard = 0
+            num_kv_heads_on_shard = 0
+            head_dims_on_shard = []
             for submodule in shard.modules():
                 if isinstance(submodule, config.attn_class):
-                    self.shard_num_heads.append(submodule.config.num_attention_heads)
-                    self.shard_head_dims.append(submodule.head_dim)
-                    shard_idx += 0
+                    num_heads_on_shard += submodule.num_attention_heads
+                    if hasattr(submodule, "num_key_value_heads"):
+                        num_kv_heads_on_shard += submodule.num_key_value_heads
+                    if hasattr(submodule, "head_dim"):
+                        head_dims_on_shard.append(submodule.head_dim)
+
+            self.shard_num_heads.append(num_heads_on_shard)
+            self.shard_num_kv_heads.append(num_kv_heads_on_shard)
+            if head_dims_on_shard:
+                assert all(d == head_dims_on_shard[0] for d in head_dims_on_shard)
+                self.shard_head_dims.append(head_dims_on_shard[0])
+            else:
+                self.shard_head_dims.append(0)
 
         assert len(self.shard_num_heads) == len(self.module.devices)
-        assert sum(self.shard_num_heads) == config.num_attention_heads
+        # The following assertion is removed because config.num_attention_heads may not be correct
+        # for models with per-layer configurations. A check is already performed in `make_tensor_parallel`.
+        # assert sum(self.shard_num_heads) == config.num_attention_heads
         assert len(self.shard_head_dims) == len(self.module.devices)
 
-        self.overall_head_dim = self.shard_head_dims[0]
+        self.overall_head_dim = next((dim for dim in self.shard_head_dims if dim > 0), 0)
 
         self.inference_schema = (
             (
                 *self.args_schema,
-                BatchTensorDescriptor((), dtype=self.dtype), # Inputs
-                BatchTensorDescriptor((), dtype=self.dtype), # Prompts
-                BatchTensorDescriptor((), dtype=self.dtype), # Attention Mask
-                BatchTensorDescriptor((), dtype=self.dtype), # Position IDs
-                (BatchTensorDescriptor((), dtype=self.dtype), BatchTensorDescriptor((), dtype=self.dtype)), # Position Embeddings
+                BatchTensorDescriptor((), dtype=self.dtype),  # Inputs
+                BatchTensorDescriptor((), dtype=self.dtype),  # Prompts
+                BatchTensorDescriptor((), dtype=self.dtype),  # Attention Mask
+                BatchTensorDescriptor((), dtype=self.dtype),  # Position IDs
+                (
+                    BatchTensorDescriptor((), dtype=self.dtype),
+                    BatchTensorDescriptor((), dtype=self.dtype),
+                ),  # Position Embeddings
             ),
             self.kwargs_schema,
         )
@@ -102,8 +120,7 @@ class TransformerBackend(ModuleBackend):
 
         cache_tensors = []
         for device_idx, device in enumerate(self.module.devices):
-            num_heads = self.shard_num_heads[device_idx]
-            num_heads = num_heads // self.config.num_key_value_groups
+            num_heads = self.shard_num_kv_heads[device_idx]
             keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
             values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.extend((keys, values))
@@ -163,6 +180,8 @@ class TransformerBackend(ModuleBackend):
         batch_size, seq_length, hidden_size = hidden_states.shape
         worst_case_length = inference_info.prefix_length + seq_length
         attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
+        if attn_bytes_per_token == 0:
+            return 1
         return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
 
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
@@ -175,10 +194,16 @@ class TransformerBackend(ModuleBackend):
         """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
         key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
         for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i].flatten(0, 1)[:, :, :prefix_length]
+            batch_size, num_kv_heads, head_dim, max_length = key_cache[i].shape
+            key_cache[i] = key_cache[i].view(batch_size * num_kv_heads, head_dim, max_length)
+            key_cache[i] = key_cache[i][:, :, :prefix_length]
             # shape: [batch * num_kv_heads, head_dim, kv_length]
-            value_cache[i] = value_cache[i].flatten(0, 1)[:, :prefix_length]
+
+            batch_size, num_kv_heads, max_length, head_dim = value_cache[i].shape
+            value_cache[i] = value_cache[i].view(batch_size * num_kv_heads, max_length, head_dim)
+            value_cache[i] = value_cache[i][:, :prefix_length, :]
             # shape: [batch * num_kv_heads, kv_length, head_dim]
+
         layer_past = tuple(chain(*zip(key_cache, value_cache)))
         return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
 
@@ -188,10 +213,12 @@ class TransformerBackend(ModuleBackend):
         """Writes new key/value tensors back into cache, works in-place"""
         _batch_size_times_num_kv_heads, head_dim, new_length = new_kvs[0].shape
         for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
-            new_key = new_key.view(*cache_key.shape[:3], new_length)
+            batch_size, num_kv_heads, _, max_length = cache_key.shape
+            new_key = new_key.view(batch_size, num_kv_heads, head_dim, new_length)
             cache_key[:, :, :, prefix_length:new_length] = new_key[:, :, :, prefix_length:new_length]
         for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
-            new_value = new_value.view(*cache_value.shape[:2], new_length, head_dim)
+            batch_size, num_kv_heads, _, max_length = cache_value.shape
+            new_value = new_value.view(batch_size, num_kv_heads, new_length, head_dim)
             cache_value[:, :, prefix_length:new_length, :] = new_value[:, :, prefix_length:new_length, :]
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:

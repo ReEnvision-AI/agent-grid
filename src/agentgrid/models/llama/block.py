@@ -70,6 +70,8 @@ class OptimizedLlamaAttention(LlamaAttention):
         super().__init__(*args, **kwargs)
         self._rotary_graph = None
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        self.num_attention_heads = self.config.num_attention_heads
+        self.num_key_value_heads = self.config.num_key_value_heads
 
     def _optimized_apply_rotary(self, query_states, key_states, cos, sin):
         if self._rotary_graph is None:
@@ -296,7 +298,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         key_states, value_states = key_value
         key_states = key_states.permute(0, 2, 1)
         key_states = key_states.view(
-            batch_size, self.self_attn.config.num_key_value_heads, seq_length, self.self_attn.head_dim
+            batch_size, self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
         )
         value_states = value_states.view(*key_states.shape)
         return (key_states, value_states)
@@ -306,7 +308,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
     ) -> Tuple[torch.Tensor]:
         key_states, value_states = key_value
         value_states = value_states.view(
-            batch_size * self.self_attn.config.num_key_value_heads, seq_length, self.self_attn.head_dim
+            batch_size * self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
         )
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)

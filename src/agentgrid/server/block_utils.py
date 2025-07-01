@@ -7,6 +7,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from agentgrid.models.qwen2.block import WrappedQwen2Block
 from agentgrid.models.qwen3_moe.block import WrappedQwen3MoeBlock
 from agentgrid.models.qwen3.block import WrappedQwen3Block
+from agentgrid.models.nemotron import WrappedNemotronBlock
 from agentgrid.utils.convert_block import QuantType
 from agentgrid.utils.misc import get_size_in_bytes
 
@@ -61,7 +62,7 @@ def get_model_block(config, layer_idx: int = 0):
     kwargs argument **only** is necessary for specific classes, like Mixtral.
     They will not be passed to other block constructors.
     """
-    if config.block_class == WrappedQwen2Block or config.block_class == WrappedQwen3MoeBlock:
+    if config.block_class == WrappedQwen2Block or config.block_class == WrappedQwen3MoeBlock or config.block_class == WrappedNemotronBlock:
         return config.block_class(config, layer_idx)
     if config.block_class == WrappedQwen3Block:
         config = PreTrainedModel._autoset_attn_implementation(config)

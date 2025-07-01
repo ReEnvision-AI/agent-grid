@@ -41,6 +41,8 @@ class _AutoDistributedBase:
         ):
             kwargs["use_auth_token"] = True
 
+        kwargs["trust_remote_code"] = True
+
         config = AutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
         if config.model_type not in _CLASS_MAPPING:
             raise ValueError(f"Agent Grid does not support model type {config.model_type}")

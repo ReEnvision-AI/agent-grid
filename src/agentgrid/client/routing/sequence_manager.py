@@ -272,7 +272,8 @@ class RemoteSequenceManager:
                 inference_rps = span.server_info.inference_rps
                 if inference_rps is None:
                     inference_rps = default_inference_rps
-                graph.add_edge((span.peer_id, block_idx), (span.peer_id, block_idx + 1), 1.0 / inference_rps)
+                delay = 1.0 / inference_rps if inference_rps > 0 else float("inf")
+                graph.add_edge((span.peer_id, block_idx), (span.peer_id, block_idx + 1), delay)
 
         return graph
 
@@ -315,7 +316,11 @@ class RemoteSequenceManager:
                 [span.length if client_server_rtts.get(span.peer_id) != np.inf else eps for span in candidate_spans],
                 dtype=np.float64,
             )
-            chosen_span = np.random.choice(candidate_spans, p=span_weights / span_weights.sum())
+            total_weight = span_weights.sum()
+            if total_weight > 0:
+                chosen_span = np.random.choice(candidate_spans, p=span_weights / total_weight)
+            else:
+                chosen_span = np.random.choice(candidate_spans)
 
             assert chosen_span.start <= current_index < chosen_span.end
             span_sequence.append(dataclasses.replace(chosen_span, start=current_index))

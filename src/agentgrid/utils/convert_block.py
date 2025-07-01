@@ -122,16 +122,22 @@ def make_tensor_parallel(
         tp_config = get_bloom_config(model_config, devices)
         del tp_config.state_rules[re.compile(".*word_embeddings.weight$")]
     else:
-        if len(devices) > 1:
-            logger.warning("Tensor parallelism is not tested for models other than BLOOM yet, proceed with caution")
         tp_config = None
+
+    expected_heads = 0
+    for submodule in block.modules():
+        if isinstance(submodule, model_config.attn_class):
+            expected_heads += submodule.config.num_attention_heads
+
     tp_block = tp.TensorParallel(block, devices, tensor_parallel_config=tp_config, output_device=output_device, delay_init=True)
     total_heads = 0
     for tp_shard in tp_block.module_shards:
         for submodule in tp_shard.modules():
             if isinstance(submodule, model_config.attn_class):
                 total_heads += submodule.config.num_attention_heads
-    assert total_heads == model_config.num_attention_heads
+    assert total_heads == expected_heads, (
+        f"Number of attention heads mismatch: sharded block has {total_heads}, original block has {expected_heads}"
+    )
     return tp_block
 
 

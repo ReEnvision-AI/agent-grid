@@ -38,3 +38,4 @@ run_podman.sh
 set_of_modules.txt
 start_swarm.sh
 deploy.py
+scripts/

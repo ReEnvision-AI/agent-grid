@@ -579,7 +579,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": agentgrid.__version__,
             "dht_client_mode": self.dht.client_mode,
-            CACHE_TOKENS_AVAILABLE: backend.memory_cache.bytes_left // max(backend.cache_bytes_per_token.values()),
+            CACHE_TOKENS_AVAILABLE: backend.memory_cache.bytes_left // max(1, *backend.cache_bytes_per_token.values()),
         }
 
         if request.uid:
