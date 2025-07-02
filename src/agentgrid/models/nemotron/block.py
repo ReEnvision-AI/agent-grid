@@ -134,6 +134,12 @@ class OptimizedNemotronFlashAttention2(DeciLMFlashAttention2, BaseNemotronAttent
     ):
         output_attentions = False
 
+        if position_ids is None:
+            past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
+            position_ids = torch.arange(
+                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+            ).unsqueeze(0)
+
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
