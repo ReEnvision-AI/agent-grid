@@ -37,5 +37,11 @@ run_client.sh
 run_podman.sh
 set_of_modules.txt
 start_swarm.sh
+start_server.sh
 deploy.py
 scripts/
+dev.id
+models
+.env
+.vscode
+.gitignore

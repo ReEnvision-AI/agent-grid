@@ -2,38 +2,75 @@ import os
 import subprocess
 from dotenv import load_dotenv
 
-# Load environment variables from the .env file
-load_dotenv(override=True)
+def run_command(command, input_data=None):
+    """Runs a command, prints its output, and checks for errors."""
+    print(f"Running: {' '.join(command)}")
+    try:
+        kwargs = {
+            "check": True,
+            "text": True,
+        }
+        if input_data:
+            kwargs["input"] = input_data
+            kwargs["capture_output"] = True
 
-# Get teh Github token
-cr_pat = os.getenv("CR_PAT")
-if not cr_pat:
-    raise ValueError("CR_PAT is not set.")
+        process = subprocess.run(command, **kwargs)
 
-cr_user = os.getenv("CR_USER")
-if not cr_user:
-    raise ValueError("CR_USER is not set")
+        if input_data:  # Only print if we captured it
+            if process.stdout:
+                print(process.stdout)
+            if process.stderr:
+                print(process.stderr)
 
-# Define the version for the Docker Image
-version = os.getenv("AGENT_GRID_VERSION", "1.1.2")
-print(f"Building Agent Grid container version {version}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {' '.join(command)}")
+        # If output was captured, it's in e.stderr.
+        if e.stderr:
+            print(e.stderr)
+        raise
 
-# Login to Github Container Registry using podman
-login_command = f"echo {cr_pat} | podman login ghcr.io -u {cr_user} --password-stdin"
-subprocess.run(login_command, shell=True, check=True)
+def main():
+    """Main function to build and push the Docker image."""
+    # Load environment variables from the .env file
+    load_dotenv(override=True)
 
-# Build the image with podman
-build_command = f"podman build -t ghcr.io/reenvision-ai/agent-grid:{version} ."
-subprocess.run(build_command, shell=True, check=True)
+    # Get the GitHub token
+    cr_pat = os.getenv("CR_PAT")
+    if not cr_pat:
+        raise ValueError("CR_PAT is not set.")
 
-# Push the image to the registry
-push_command = f"podman push ghcr.io/reenvision-ai/agent-grid:{version}"
-subprocess.run(push_command, shell=True, check=True)
+    cr_user = os.getenv("CR_USER")
+    if not cr_user:
+        raise ValueError("CR_USER is not set")
 
-if version != "latest" and "beta" not in version:
+    # Define the version for the Docker Image
+    version = os.getenv("AGENT_GRID_VERSION", "1.1.2")
+    print(f"Building Agent Grid container version {version}")
 
-    tag_command = f"podman tag ghcr.io/reenvision-ai/agent-grid:{version} ghcr.io/reenvision-ai/agent-grid:latest"
-    subprocess.run(tag_command, shell=True, check=True)
+    image_name = "ghcr.io/reenvision-ai/agent-grid"
+    image_with_version = f"{image_name}:{version}"
+    latest_image = f"{image_name}:latest"
 
-    push_command = f"podman push ghcr.io/reenvision-ai/agent-grid:latest"
-    subprocess.run(push_command, shell=True, check=True)
+    # Login to Github Container Registry using podman
+    login_command = ["podman", "login", "ghcr.io", "-u", cr_user, "--password-stdin"]
+    run_command(login_command, input_data=cr_pat)
+
+    # Build the image with podman
+    build_command = ["podman", "build", "-t", image_with_version, "."]
+    run_command(build_command)
+
+    # Push the image to the registry
+    push_command = ["podman", "push", image_with_version]
+    run_command(push_command)
+
+    if version != "latest" and "beta" not in version:
+        # Tag the image as latest
+        tag_command = ["podman", "tag", image_with_version, latest_image]
+        run_command(tag_command)
+
+        # Push the latest image
+        push_latest_command = ["podman", "push", latest_image]
+        run_command(push_latest_command)
+
+if __name__ == "__main__":
+    main()

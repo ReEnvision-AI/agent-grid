@@ -59,6 +59,12 @@ class OptimizedNemotronAttention(DeciLMAttention, BaseNemotronAttention):
     ):
         bsz, q_len, _ = hidden_states.size()
 
+        if position_ids is None:
+            past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
+            position_ids = torch.arange(
+                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+            ).unsqueeze(0)
+
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
