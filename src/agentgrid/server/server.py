@@ -778,7 +778,7 @@ class ModuleAnnouncerThread(threading.Thread):
         while True:
             start_time = time.perf_counter()
 
-            self.server_info.cache_tokens_left = self.memory_cache.bytes_left // self.bytes_per_token
+            self.server_info.cache_tokens_left = int(self.memory_cache.bytes_left // self.bytes_per_token)
             if self.server_info.state != ServerState.OFFLINE:
                 self._ping_next_servers()
                 self.server_info.next_pings = {
