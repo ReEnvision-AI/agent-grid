@@ -29,6 +29,7 @@ def get_block_size(
     dtype: Optional[Union[str, torch.dtype]] = None,
     quant_type: QuantType = QuantType.NONE,
     eps: float = 0.01,  # eps accounts for ~1% of metainfo for tensor descriptions, quantization tables, etc.
+    block_index: int = 0,
 ) -> int:
     if location == "memory":
         assert (
@@ -36,7 +37,7 @@ def get_block_size(
         ), 'get_block_size(..., location="memory") requires to specify dtype and quant_type for calculations'
 
     with init_empty_weights(include_buffers=False):
-        block = get_model_block(config)
+        block = get_model_block(config, block_index)
         n_params = sum(param.numel() for param in block.parameters())
 
     if location == "memory":

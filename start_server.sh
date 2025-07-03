@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Enable job control
+set -m
+
+cleanup() {
+    echo "Shutting down the server and its child processes..."
+    kill -- -"$PYTHON_PID"
+    echo "Cleanup complete"
+}
+
 # Check if .env file exists
 if [ ! -f ".env" ]; then
     echo "Error: .env file not found. Please create a .env file with required variables."
@@ -23,7 +32,7 @@ done
 # Get user selection
 while true; do
     read -p "Enter the number of your choice (1-${#MODELS[@]}): " choice
-    if [[ "$choice" =~ ^[1-9]$ ]]; then
+    if [[ "$choice" =~ ^[1-9][0-9]*$ && "$choice" -le "${#MODELS[@]}" ]]; then
         MODEL=${MODELS[$((choice-1))]}
         break
     else
@@ -43,6 +52,9 @@ DISK_SPACE='120GB'
 
 source .env
 
+# Set a trap to call the cleanup function upon receiving SIGINT (Ctrl+C)
+trap cleanup SIGINT SIGTERM EXIT
+
 python -m agentgrid.cli.run_server \
     --max_disk_space $DISK_SPACE \
     --public_ip $PUBLIC_IP \
@@ -52,4 +64,10 @@ python -m agentgrid.cli.run_server \
     --throughput 'eval' \
     --inference_max_length "${MAX_LENGTH}" \
     --attn_cache_tokens "${ATTN_CACHE_TOKENS}" \
-    $MODEL
+    $MODEL &
+    
+PYTHON_PID=$!
+
+echo "Server started with PID: $PYTHON_PID. Press Ctrl+C to stop."
+
+wait $PYTHON_PID

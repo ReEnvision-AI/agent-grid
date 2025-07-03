@@ -191,7 +191,23 @@ class Server:
         self.quant_type = quant_type
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
-        is_multiquery_attn = self.block_config.num_key_value_groups > 1
+        if hasattr(self.block_config, "block_configs") and self.block_config.block_configs is not None:
+            num_key_value_groups = [
+                self.block_config.num_attention_heads // b.attention.n_heads_in_group if b.attention.n_heads_in_group else None
+                for b in self.block_config.block_configs
+            ]
+            is_multiquery_attn = any(g is not None and g > 1 for g in num_key_value_groups)
+        elif hasattr(self.block_config, "num_key_value_heads") and isinstance(
+            self.block_config.num_key_value_heads, list
+        ):
+            num_key_value_groups = [
+                self.block_config.num_attention_heads // n_kv_h for n_kv_h in self.block_config.num_key_value_heads
+            ]
+            is_multiquery_attn = any(g > 1 for g in num_key_value_groups)
+        else:
+            num_key_value_groups = self.block_config.num_key_value_groups
+            is_multiquery_attn = num_key_value_groups > 1
+
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
@@ -204,9 +220,15 @@ class Server:
         # For attention cache in GPU or RAM
         if attn_cache_tokens is None:
             attn_cache_tokens = 16384 if is_multiquery_attn else 4096
-        cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
-        cache_values_per_block //= self.block_config.num_key_value_groups
-        self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
+
+        base_cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
+        if isinstance(num_key_value_groups, list):
+            cache_values_per_block = [base_cache_values_per_block // g if g else 0 for g in num_key_value_groups]
+            avg_cache_values_per_block = sum(cache_values_per_block) / len(cache_values_per_block) if cache_values_per_block else 0
+            self._cache_bytes_per_block = avg_cache_values_per_block * get_size_in_bytes(self.torch_dtype)
+        else:
+            cache_values_per_block = base_cache_values_per_block // num_key_value_groups
+            self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
 
         # For disk cache
         self.cache_dir = cache_dir
@@ -300,8 +322,32 @@ class Server:
         # Estimate of GPU memory used in rpc_backward (2 GiB for BLOOM, proportional for other models)
         autograd_memory = 2 * gib * num_devices / 14336 * self.block_config.hidden_size
 
-        block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
-        total_memory_per_block = block_size + self._cache_bytes_per_block
+        if hasattr(self.block_config, "block_configs") and self.block_config.block_configs is not None:
+            block_sizes = []
+            for i, b in enumerate(self.block_config.block_configs):
+                if b.attention.n_heads_in_group is not None:
+                    block_sizes.append(
+                        get_block_size(
+                            self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
+                        )
+                    )
+            avg_block_size = sum(block_sizes) / len(block_sizes) if block_sizes else 0
+        elif hasattr(self.block_config, "num_key_value_heads") and isinstance(
+            self.block_config.num_key_value_heads, list
+        ):
+            block_sizes = [
+                get_block_size(
+                    self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
+                )
+                for i in range(self.block_config.num_hidden_layers)
+            ]
+            avg_block_size = sum(block_sizes) / len(block_sizes) if block_sizes else 0
+        else:
+            avg_block_size = get_block_size(
+                self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type
+            )
+
+        total_memory_per_block = avg_block_size + self._cache_bytes_per_block
         if self.adapters:
             # Delay import of agentgrid.utils.peft to avoid unnecessary import of bitsandbytes
             from agentgrid.utils.peft import estimate_adapter_memory_per_block
@@ -696,7 +742,21 @@ class ModuleAnnouncerThread(threading.Thread):
         self.memory_cache = memory_cache
 
         self.bytes_per_token = block_config.hidden_size * get_size_in_bytes(DTYPE_MAP[server_info.torch_dtype])
-        self.bytes_per_token //= block_config.num_key_value_groups
+        if hasattr(block_config, "block_configs") and block_config.block_configs is not None:
+            num_key_value_groups_list = []
+            for b in block_config.block_configs:
+                if b.attention.n_heads_in_group is not None:
+                    num_key_value_groups_list.append(block_config.num_attention_heads // b.attention.n_heads_in_group)
+            avg_num_key_value_groups = sum(num_key_value_groups_list) / len(num_key_value_groups_list) if num_key_value_groups_list else 1
+            self.bytes_per_token /= avg_num_key_value_groups
+        elif hasattr(block_config, "num_key_value_heads") and isinstance(block_config.num_key_value_heads, list):
+            num_key_value_groups_list = [
+                block_config.num_attention_heads // n_kv_h for n_kv_h in block_config.num_key_value_heads
+            ]
+            avg_num_key_value_groups = sum(num_key_value_groups_list) / len(num_key_value_groups_list)
+            self.bytes_per_token /= avg_num_key_value_groups
+        else:
+            self.bytes_per_token //= block_config.num_key_value_groups
 
         self.update_period = update_period
         self.expiration = expiration

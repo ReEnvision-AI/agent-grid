@@ -42,14 +42,12 @@ done
 
 
 PORT=31331
-MAX_LENGTH=136192
 ALLOC_TIMEOUT=6000
 ATTN_CACHE_TOKENS=128000
 PUBLIC_IP=$(curl ipinfo.io/ip)
 P2P_FILE='./dev.id'
 DISK_SPACE='120GB'
-INFERENCE_MAX_LENGTH=40960
-MAX_CHUNK_SIZE_BYTES=1073741824
+INFERENCE_MAX_LENGTH=136192
 
 source .env
 
@@ -57,13 +55,11 @@ source .env
 trap cleanup SIGINT SIGTERM EXIT
 
 python -m agentgrid.cli.run_server \
-    --max_disk_space $DISK_SPACE \
     --public_ip $PUBLIC_IP \
     --device cuda \
     --torch_dtype bfloat16 \
     --quant_type nf4 \
     --port $PORT \
-    --max_chunk_size_bytes "${MAX_CHUNK_SIZE_BYTES}" \
     --token $HF_TOKEN \
     --attn_cache_tokens "${ATTN_CACHE_TOKENS}" \
     --inference_max_length "${INFERENCE_MAX_LENGTH}" \
