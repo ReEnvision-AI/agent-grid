@@ -89,5 +89,7 @@ COPY --from=builder /usr/local/bin/ /usr/local/bin/
 # Copy the application code
 COPY --from=builder /home/agent-grid/ /home/agent-grid/
 
+ENV HF_HUB_DISABLE_XET=1
+
 WORKDIR /home/agent-grid/
 CMD bash
