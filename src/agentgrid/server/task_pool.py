@@ -175,8 +175,5 @@ def _move_to_device_if_tensor(arg: Any, device: Union[torch.device, str], share_
         if share_memory:
             arg = arg.share_memory_()
     elif isinstance(arg, tuple):
-        t = ()
-        for a in arg:
-            t = t + (_move_to_device_if_tensor(a, device, share_memory), )
-        arg = t    
+        arg = tuple(_move_to_device_if_tensor(a, device, share_memory) for a in arg)
     return arg
