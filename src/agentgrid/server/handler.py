@@ -170,7 +170,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 async with self._allocate_cache(
                     requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
                 ) as cache_handles:
-                    background_tasks = set()
+                    background_task = None
                     async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
                         requested_uids=requested_uids,
                         requested_backends=requested_backends,
@@ -186,9 +186,10 @@ class TransformerConnectionHandler(ConnectionHandler):
                         args_structure=args_structure,
                     ):
                         if can_push:
-                            task = asyncio.create_task(self._push_outputs(request, output_tensors[0], step_metadata))
-                            background_tasks.add(task)  # Keep reference until it is done to save it from GC
-                            task.add_done_callback(background_tasks.discard)
+                            if background_task is None:
+                                background_task = asyncio.create_task(
+                                    self._push_outputs(request, output_tensors[0], step_metadata)
+                                )
                         yield runtime_pb2.ExpertResponse(tensors=output_tensors)
 
             finally:

@@ -8,7 +8,7 @@ DUMMY_KEY_PAST = torch.empty((0, 0, 0))
 
 
 def is_dummy(tensor: torch.Tensor) -> bool:
-    return tensor.numel() == 0
+    return tensor is None or tensor.numel() == 0
 
 
 SPECIAL_DTYPE_SIZES = {torch.bool: 1, torch.qint8: 1, torch.qint32: 4}

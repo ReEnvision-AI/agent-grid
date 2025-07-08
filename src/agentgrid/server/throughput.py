@@ -118,9 +118,15 @@ def measure_throughput_info(
     logger.info(
         "Measuring network and compute throughput. This takes about a minute and will be cached for future runs"
     )
+
+    block = get_model_block(config)
+    block = block.to(dtype)
+    block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
+
     return {
         "inference_rps": measure_compute_rps(
             config,
+            block,
             device,
             dtype,
             quant_type=quant_type,
@@ -131,6 +137,7 @@ def measure_throughput_info(
         ),
         "forward_rps": measure_compute_rps(
             config,
+            block,
             device,
             dtype,
             quant_type=quant_type,
@@ -188,6 +195,7 @@ def _measure_bits_per_second(pipe_send: mp.Pipe):
 
 def measure_compute_rps(
     config: PretrainedConfig,
+    block: torch.nn.Module,
     device: torch.device,
     dtype: torch.dtype,
     *,
@@ -201,10 +209,6 @@ def measure_compute_rps(
     if not tensor_parallel_devices:
         tensor_parallel_devices = (device,)
     with torch.inference_mode():
-        block = get_model_block(config)
-        block = block.to(dtype)
-        block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
-
         if hasattr(config, 'block_configs') and config.block_configs is not None:
             # For Nemotron models, get num_kv_heads from block_configs
             num_kv_heads = config.block_configs[0].attention.n_heads_in_group

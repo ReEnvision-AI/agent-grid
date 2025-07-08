@@ -146,30 +146,42 @@ class TransformerBackend(ModuleBackend):
         inference_info: InferenceMetadata,
     ) -> Tuple[torch.Tensor, ...]:
         assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]"
-        
+
         assert isinstance(position_embeddings, tuple), "expected position_embeddings to be a tuple"
         seq_len = hidden_states.shape[1]
 
         with self.memory_cache.use_cache(
             *inference_info.cache_handles
         ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter):
-
             # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
             # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
             # is at least 4-6x less than `autograd_memory`.
             max_chunk_length = self._estimate_max_chunk_length(hidden_states, inference_info)
-            output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None
             layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length)
-            for offset in range(0, seq_len, max_chunk_length):
-                hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :]
-                output_hidden_states_chunk, new_kvs = self.module.forward(
-                    hidden_states_chunk, layer_past=layer_past, use_cache=True, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings
+
+            if seq_len <= max_chunk_length:
+                output_hidden_states, new_kvs = self.module.forward(
+                    hidden_states,
+                    layer_past=layer_past,
+                    use_cache=True,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
                 )
-                if seq_len > max_chunk_length:
+            else:
+                output_hidden_states = torch.empty_like(hidden_states)
+                for offset in range(0, seq_len, max_chunk_length):
+                    hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :]
+                    output_hidden_states_chunk, new_kvs = self.module.forward(
+                        hidden_states_chunk,
+                        layer_past=layer_past,
+                        use_cache=True,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                    )
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
-                else:
-                    output_hidden_states = output_hidden_states_chunk  # saves one memcopy
-                layer_past = new_kvs
+                    layer_past = new_kvs
 
             self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length)
             return (output_hidden_states,)

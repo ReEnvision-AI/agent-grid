@@ -67,24 +67,6 @@ def should_choose_other_blocks(
     _move_span(local_span, new_start)
     throughputs[local_span.start : local_span.end] += local_span.throughput
 
-    moved = True
-    while moved:
-        servers = list(spans.keys())
-        np.random.shuffle(servers)
-
-        moved = False
-        for peer_id in servers:
-            span = spans[peer_id]
-            throughputs[span.start : span.end] -= span.throughput * (1 + eps)
-
-            new_start = _choose_best_start(throughputs, span.length)
-
-            throughputs[span.start : span.end] += span.throughput * eps
-            if span.start != new_start:
-                _move_span(span, new_start)
-                moved = True
-            throughputs[span.start : span.end] += span.throughput
-
     new_throughput = throughputs.min()
     if new_throughput < initial_throughput or new_throughput < eps:
         return False

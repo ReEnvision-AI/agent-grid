@@ -322,31 +322,7 @@ class Server:
         # Estimate of GPU memory used in rpc_backward (2 GiB for BLOOM, proportional for other models)
         autograd_memory = 2 * gib * num_devices / 14336 * self.block_config.hidden_size
 
-        if hasattr(self.block_config, "block_configs") and self.block_config.block_configs is not None:
-            block_sizes = []
-            for i, b in enumerate(self.block_config.block_configs):
-                if b.attention.n_heads_in_group is not None:
-                    block_sizes.append(
-                        get_block_size(
-                            self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
-                        )
-                    )
-            avg_block_size = sum(block_sizes) / len(block_sizes) if block_sizes else 0
-        elif hasattr(self.block_config, "num_key_value_heads") and isinstance(
-            self.block_config.num_key_value_heads, list
-        ):
-            block_sizes = [
-                get_block_size(
-                    self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
-                )
-                for i in range(self.block_config.num_hidden_layers)
-            ]
-            avg_block_size = sum(block_sizes) / len(block_sizes) if block_sizes else 0
-        else:
-            avg_block_size = get_block_size(
-                self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type
-            )
-
+        avg_block_size = self._get_avg_block_size_in_bytes()
         total_memory_per_block = avg_block_size + self._cache_bytes_per_block
         if self.adapters:
             # Delay import of agentgrid.utils.peft to avoid unnecessary import of bitsandbytes
@@ -370,6 +346,32 @@ class Server:
             f"If you want to leave some free GPU memory, please specify a lesser --num_blocks manually"
         )
         return num_blocks
+
+    def _get_avg_block_size_in_bytes(self) -> float:
+        if hasattr(self.block_config, "block_configs") and self.block_config.block_configs is not None:
+            block_sizes = []
+            for i, b in enumerate(self.block_config.block_configs):
+                if b.attention.n_heads_in_group is not None:
+                    block_sizes.append(
+                        get_block_size(
+                            self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
+                        )
+                    )
+            return sum(block_sizes) / len(block_sizes) if block_sizes else 0
+        elif hasattr(self.block_config, "num_key_value_heads") and isinstance(
+            self.block_config.num_key_value_heads, list
+        ):
+            block_sizes = [
+                get_block_size(
+                    self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
+                )
+                for i in range(self.block_config.num_hidden_layers)
+            ]
+            return sum(block_sizes) / len(block_sizes) if block_sizes else 0
+        else:
+            return get_block_size(
+                self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type
+            )
 
     def run(self):
         while True:

@@ -20,6 +20,15 @@ from agentgrid.utils.convert_block import QuantType
 from agentgrid.utils.misc import DUMMY, is_dummy
 from agentgrid.utils.packaging import unpack_args_kwargs
 
+
+def _prepare_prompts(prompts: torch.Tensor, requested_backends: Sequence[TransformerBackend]) -> List[torch.Tensor]:
+    """Prepare prompts for use in forward and backward passes."""
+    if prompts is None or is_dummy(prompts):
+        return [DUMMY] * len(requested_backends)
+    else:
+        return [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
+
+
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # TODO: Increase the NF4 threshold once bitsandbytes ships efficient NF4 kernel for parallel forward
@@ -59,10 +68,7 @@ async def run_rpc_forward(
     # check parse input tensors and cast dtypes
     hidden_states = hidden_states.to(dtype)
     assert hidden_states.ndim == 3
-    if prompts is None or is_dummy(prompts):
-        prompts = [DUMMY] * len(requested_backends)
-    else:
-        prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
+    prompts = _prepare_prompts(prompts, requested_backends)
 
     # Run a chain of requested backends
     for backend, prompt in zip(requested_backends, prompts):
@@ -107,10 +113,7 @@ async def run_rpc_backward(
     inputs = inputs.to(requested_backends[0].dtype)
     grad_outputs = grad_outputs.to(requested_backends[-1].dtype)
 
-    if prompts is None or is_dummy(prompts):
-        prompts = [DUMMY] * len(requested_backends)
-    else:
-        prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
+    prompts = _prepare_prompts(prompts, requested_backends)
 
     # Run a forward chain to collect intermediate inputs
     # Note that we do not forward for the last module since we do not need its output
@@ -192,8 +195,7 @@ async def iterate_rpc_inference(
         hidden_states = hidden_states.to(requested_backends[0].dtype)
 
         # parse deep prompts (optional argument)
-        has_prompts = prompts is not None and not is_dummy(prompts)
-        if not has_prompts:
+        if prompts is None or is_dummy(prompts):
             prompts = [None] * len(requested_backends)
         else:
             prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
@@ -241,7 +243,7 @@ async def iterate_rpc_inference(
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
             for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
-        can_push = not has_prompts
+        can_push = all(is_dummy(p) for p in prompts)
         yield output_tensors, can_push, step_metadata
 
         # prepare for next step
