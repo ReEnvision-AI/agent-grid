@@ -10,7 +10,7 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
-from typing import AsyncContextManager, Dict, Optional, Sequence
+from typing import AsyncContextManager, Counter, Dict, Optional, Sequence
 
 import async_timeout
 import torch
@@ -109,10 +109,13 @@ class MemoryCache:
     @staticmethod
     def get_allocation_size(*descriptors: TensorDescriptor) -> int:
         """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
-        alloc_size_by_device = {}
+        if not descriptors:
+            return 0
+
+        alloc_size_by_device = Counter()
         for descr in descriptors:
             tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
-            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
+            alloc_size_by_device[descr.device] += tensor_size
         return max(alloc_size_by_device.values())
 
     async def _schedule_alloc(
@@ -209,7 +212,9 @@ class MemoryCache:
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
-                    self._allocated_tensors[handle] = descr.make_zeros()
+                    self._allocated_tensors[handle] = torch.empty(
+                        descr.shape, dtype=descr.dtype, device=descr.device
+                    )
                     assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
             else:  # delete tensors by handle
                 for handle in recv_handles:

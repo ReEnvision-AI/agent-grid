@@ -384,19 +384,7 @@ class WrappedNemotronBlock(OptimizedNemotronDecoderLayer):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        batch_size, seq_length, _ = hidden_states.shape
-
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        
         past_key_value = layer_past
-        if self.attention_config.no_op:
-            pass
-        elif past_key_value is not None:
-            past_key_values_length = past_key_value[0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-            past_key_value = self._reorder_cache_from_bloom_to_llama(past_key_value, batch_size, past_key_values_length)
 
         outputs = super().forward(
             hidden_states,
@@ -409,35 +397,4 @@ class WrappedNemotronBlock(OptimizedNemotronDecoderLayer):
             **kwargs,
         )
 
-        if self.attention_config.no_op:
-            pass
-        elif use_cache:
-            present_key_value = outputs[-1]
-            present_key_value = self._reorder_cache_from_llama_to_bloom(
-                present_key_value, batch_size, seq_length_with_past
-            )
-            outputs = outputs[:-1] + (present_key_value,)
-            #self._cache = present_key_value
         return outputs
-
-    def _reorder_cache_from_bloom_to_llama(
-        self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
-    ) -> Tuple[torch.Tensor]:
-        key_states, value_states = key_value
-        key_states = key_states.permute(0, 2, 1)
-        key_states = key_states.view(
-            batch_size, self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        value_states = value_states.view(*key_states.shape)
-        return (key_states, value_states)
-
-    def _reorder_cache_from_llama_to_bloom(
-        self, key_value: Tuple[torch.Tensor, torch.Tensor], batch_size: int, seq_length: int
-    ) -> Tuple[torch.Tensor]:
-        key_states, value_states = key_value
-        value_states = value_states.view(
-            batch_size * self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        key_states = key_states.view(*value_states.shape)
-        key_states = key_states.permute(0, 2, 1)
-        return (key_states, value_states)

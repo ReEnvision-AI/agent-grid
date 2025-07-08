@@ -121,7 +121,7 @@ class TransformerBackend(ModuleBackend):
         cache_tensors = []
         for device_idx, device in enumerate(self.module.devices):
             num_heads = self.shard_num_kv_heads[device_idx]
-            keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
+            keys = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.extend((keys, values))
         return cache_tensors
@@ -194,15 +194,8 @@ class TransformerBackend(ModuleBackend):
         """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
         key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
         for i in range(len(key_cache)):
-            batch_size, num_kv_heads, head_dim, max_length = key_cache[i].shape
-            key_cache[i] = key_cache[i].view(batch_size * num_kv_heads, head_dim, max_length)
-            key_cache[i] = key_cache[i][:, :, :prefix_length]
-            # shape: [batch * num_kv_heads, head_dim, kv_length]
-
-            batch_size, num_kv_heads, max_length, head_dim = value_cache[i].shape
-            value_cache[i] = value_cache[i].view(batch_size * num_kv_heads, max_length, head_dim)
-            value_cache[i] = value_cache[i][:, :prefix_length, :]
-            # shape: [batch * num_kv_heads, kv_length, head_dim]
+            key_cache[i] = key_cache[i][:, :, :prefix_length, :]
+            value_cache[i] = value_cache[i][:, :, :prefix_length, :]
 
         layer_past = tuple(chain(*zip(key_cache, value_cache)))
         return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
@@ -211,15 +204,12 @@ class TransformerBackend(ModuleBackend):
         self, cache_tensors: Sequence[torch.Tensor], new_kvs: Sequence[torch.Tensor], prefix_length: int
     ):
         """Writes new key/value tensors back into cache, works in-place"""
-        _batch_size_times_num_kv_heads, head_dim, new_length = new_kvs[0].shape
-        for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
-            batch_size, num_kv_heads, _, max_length = cache_key.shape
-            new_key = new_key.view(batch_size, num_kv_heads, head_dim, new_length)
-            cache_key[:, :, :, prefix_length:new_length] = new_key[:, :, :, prefix_length:new_length]
-        for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
-            batch_size, num_kv_heads, _, max_length = cache_value.shape
-            new_value = new_value.view(batch_size, num_kv_heads, new_length, head_dim)
-            cache_value[:, :, prefix_length:new_length, :] = new_value[:, :, prefix_length:new_length, :]
+        if not new_kvs:
+            return
+
+        new_length = new_kvs[0].shape[2]
+        for i in range(len(new_kvs)):
+            cache_tensors[i][:, :, prefix_length:new_length, :] = new_kvs[i][:, :, prefix_length:new_length, :]
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         return self.forward_pool, self.backward_pool, self.inference_pool

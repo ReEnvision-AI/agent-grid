@@ -16,7 +16,6 @@ from transformers import PretrainedConfig
 from agentgrid.server.block_utils import get_model_block, resolve_block_dtype
 from agentgrid.utils.convert_block import QuantType, convert_block
 from agentgrid.utils.disk_cache import DEFAULT_CACHE_DIR
-from agentgrid.utils.misc import DUMMY_KEY_PAST
 
 logger = get_logger(__name__)
 
@@ -206,7 +205,22 @@ def measure_compute_rps(
         block = block.to(dtype)
         block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
 
-        cache = (DUMMY_KEY_PAST.to(dtype=dtype, device=device), DUMMY_KEY_PAST.to(dtype=dtype, device=device))
+        if hasattr(config, 'block_configs') and config.block_configs is not None:
+            # For Nemotron models, get num_kv_heads from block_configs
+            num_kv_heads = config.block_configs[0].attention.n_heads_in_group
+            head_dim = config.hidden_size // config.num_attention_heads
+        else:
+            # For Llama and other models
+            head_dim = config.hidden_size // config.num_attention_heads
+            num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+
+        dummy_key = torch.randn(
+            1, num_kv_heads, 1, head_dim, device=device, dtype=dtype
+        )
+        dummy_value = torch.randn(
+            1, num_kv_heads, 1, head_dim, device=device, dtype=dtype
+        )
+        cache = (dummy_key, dummy_value)
         elapsed = 0
         dummy_input = torch.randn(1, n_tokens, config.hidden_size, device=device, dtype=dtype)
 

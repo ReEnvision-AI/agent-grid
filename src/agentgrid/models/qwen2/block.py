@@ -208,55 +208,15 @@ class WrappedQwen2Block(OptimizedQwen2DecoderLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
-        batch_size, seq_length, _ = hidden_states.shape
-
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        past_key_value = layer_past
-        if past_key_value is not None:
-            past_key_values_length = past_key_value[0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-            past_key_value = self._reorder_cache_from_bloom_to_llama(past_key_value, batch_size, past_key_values_length)
-
         outputs = super().forward(
             hidden_states,
             *args,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_value=layer_past,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
             **kwargs,
         )
 
-        if use_cache:
-            present_key_value = outputs[-1]
-            present_key_value = self._reorder_cache_from_llama_to_bloom(
-                present_key_value, batch_size, seq_length_with_past
-            )
-            outputs = outputs[:-1] + (present_key_value,)
-
         return outputs
-
-    def _reorder_cache_from_bloom_to_llama(
-        self, key_value: tuple[torch.Tensor], batch_size: int, seq_length: int
-    ) -> tuple[torch.Tensor]:
-        key_states, value_states = key_value
-        key_states = key_states.permute(0, 2, 1)
-        key_states = key_states.view(
-            batch_size, self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        value_states = value_states.view(*key_states.shape)
-        return (key_states, value_states)
-
-    def _reorder_cache_from_llama_to_bloom(
-        self, key_value: tuple[torch.Tensor], batch_size: int, seq_length: int
-    ) -> tuple[torch.Tensor]:
-        key_states, value_states = key_value
-        value_states = value_states.view(
-            batch_size * self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        key_states = key_states.view(*value_states.shape)
-        key_states = key_states.permute(0, 2, 1)
-        return (key_states, value_states)
