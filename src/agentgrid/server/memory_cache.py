@@ -10,7 +10,7 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
-from typing import AsyncContextManager, Counter, Dict, Optional, Sequence
+from typing import AsyncContextManager, Counter, Dict, List, Optional, Sequence
 
 import async_timeout
 import torch
@@ -34,6 +34,7 @@ class MemoryCache:
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
+        self._free_pools: Dict[TensorDescriptor, List[torch.Tensor]] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
@@ -212,9 +213,12 @@ class MemoryCache:
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
-                    self._allocated_tensors[handle] = torch.empty(
-                        descr.shape, dtype=descr.dtype, device=descr.device
-                    )
+                    if not self._free_pools.get(descr):
+                        self._allocated_tensors[handle] = torch.empty(
+                            descr.shape, dtype=descr.dtype, device=descr.device
+                        )
+                    else:
+                        self._allocated_tensors[handle] = self._free_pools[descr].pop()
                     assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
             else:  # delete tensors by handle
                 for handle in recv_handles:
@@ -222,7 +226,12 @@ class MemoryCache:
                         logger.warning(
                             f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
                         )
-                    self._allocated_tensors.pop(handle, None)
+                        continue
+                    tensor = self._allocated_tensors.pop(handle)
+                    descr = TensorDescriptor.from_tensor(tensor)
+                    if descr not in self._free_pools:
+                        self._free_pools[descr] = []
+                    self._free_pools[descr].append(tensor)
         yield tuple(self._allocated_tensors[handle] for handle in handles)
 
 
