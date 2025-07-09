@@ -73,21 +73,69 @@ class AgentGridCache(Cache):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+        This method is kept for API compatibility with transformers.Cache but the main update logic
+        for this backend is in `update_sharded`.
         """
-        if cache_kwargs is None:
-            cache_kwargs = {}
-        prefix_length = cache_kwargs.get("prefix_length", 0)
+        # This method is not expected to be called in the current agentgrid flow,
+        # but is implemented for correctness and compatibility.
+        prefix_length = (cache_kwargs or {}).get("prefix_length", self._seq_length)
+        self.update_sharded(
+            PerDeviceTensors(key_states), PerDeviceTensors(value_states), prefix_length=prefix_length
+        )
+        return key_states, value_states
 
-        key_cache_tensor = self.tensors[2 * layer_idx]
-        value_cache_tensor = self.tensors[2 * layer_idx + 1]
+    def update_sharded(
+        self,
+        key_states: Union[PerDeviceTensors, torch.Tensor],
+        value_states: Union[PerDeviceTensors, torch.Tensor],
+        prefix_length: int,
+    ):
+        """
+        Updates the sharded cache tensors in-place using the new key-value states.
+        It attempts to use a fused Triton kernel for performance and falls back to
+        a standard PyTorch implementation if the kernel is unavailable.
+        """
+        try:
+            from agentgrid.server.kernels import update_cache_fused
 
-        new_length = key_states.shape[2]
+            use_fused_kernel = True
+        except ImportError:
+            logger.warning("Triton kernel not found. Falling back to python-level cache update.")
+            use_fused_kernel = False
+
+        if isinstance(key_states, PerDeviceTensors):
+            key_state_shards = key_states.tensor_shards
+            value_state_shards = value_states.tensor_shards
+            new_length = key_states.shape[2]
+        else:
+            # Handle the case of a single, non-sharded tensor
+            key_state_shards = [key_states]
+            value_state_shards = [value_states]
+            new_length = key_states.shape[2]
+
         self._seq_length = new_length
 
-        key_cache_tensor[:, :, prefix_length:new_length, :] = key_states[:, :, prefix_length:new_length, :]
-        value_cache_tensor[:, :, prefix_length:new_length, :] = value_states[:, :, prefix_length:new_length, :]
+        num_shards = len(key_state_shards)
+        assert num_shards == len(value_state_shards)
+        assert num_shards * 2 == len(self.tensors)
 
-        return key_states, value_states
+        for i in range(num_shards):
+            key_cache_shard = self.tensors[i * 2]
+            value_cache_shard = self.tensors[i * 2 + 1]
+
+            key_state_shard = key_state_shards[i]
+            value_state_shard = value_state_shards[i]
+
+            if use_fused_kernel:
+                update_cache_fused(
+                    key_cache_shard, value_cache_shard, key_state_shard, value_state_shard, prefix_length
+                )
+            else:
+                # Original python-level copy as a fallback
+                if prefix_length < new_length:
+                    update_slice = slice(prefix_length, new_length)
+                    key_cache_shard[:, :, update_slice, :] = key_state_shard[:, :, update_slice, :]
+                    value_cache_shard[:, :, update_slice, :] = value_state_shard[:, :, update_slice, :]
 
 
 class TransformerBackend(ModuleBackend):
@@ -157,9 +205,6 @@ class TransformerBackend(ModuleBackend):
                 self.shard_head_dims.append(0)
 
         assert len(self.shard_num_heads) == len(self.module.devices)
-        # The following assertion is removed because config.num_attention_heads may not be correct
-        # for models with per-layer configurations. A check is already performed in `make_tensor_parallel`.
-        # assert sum(self.shard_num_heads) == config.num_attention_heads
         assert len(self.shard_head_dims) == len(self.module.devices)
 
         self.overall_head_dim = next((dim for dim in self.shard_head_dims if dim > 0), 0)
@@ -224,9 +269,7 @@ class TransformerBackend(ModuleBackend):
         ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter):
             max_length = cache_tensors[0].shape[2]  # Get max_length from the cache tensor shape
             cache = AgentGridCache(cache_tensors, max_length, len(self.module.module_shards))
-            # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
-            # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
-            # is at least 4-6x less than `autograd_memory`.
+
             max_chunk_length = self._estimate_max_chunk_length(hidden_states, inference_info)
             layer_past = cache.select_layer_past(inference_info.prefix_length)
             new_kvs = None
@@ -255,23 +298,15 @@ class TransformerBackend(ModuleBackend):
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     layer_past = new_kvs
 
-            if new_kvs is not None and len(new_kvs) > 0:
-                num_layers = len(new_kvs) // 2
-                for i in range(num_layers):
-                    key_states = new_kvs[i * 2]
-                    value_states = new_kvs[i * 2 + 1]
-                    cache.update(
-                        key_states,
-                        value_states,
-                        i,
-                        cache_kwargs={"prefix_length": inference_info.prefix_length},
-                    )
+            if new_kvs is not None and len(new_kvs) == 2:
+                # new_kvs is a tuple of (PerDeviceTensors(keys), PerDeviceTensors(values))
+                key_states, value_states = new_kvs
+                cache.update_sharded(key_states, value_states, prefix_length=inference_info.prefix_length)
 
             return (output_hidden_states,)
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
-        # We assume that attention logit matrices are the main thing that consumes memory, given that
-        # the model uses multi-query attention
+        # We assume that attention logit matrices are the main thing that consumes memory
         batch_size, seq_length, hidden_size = hidden_states.shape
         worst_case_length = inference_info.prefix_length + seq_length
         attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
@@ -341,6 +376,8 @@ class _MergedInferenceStep:
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
                 hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
-            outputs = self.backends[inference_info.uid].inference_step(hidden_states, attention_mask, position_ids, position_embeddings, inference_info)
+            outputs = self.backends[inference_info.uid].inference_step(
+                hidden_states, attention_mask, position_ids, position_embeddings, inference_info
+            )
             hidden_states = outputs[0]
         return (hidden_states,)
