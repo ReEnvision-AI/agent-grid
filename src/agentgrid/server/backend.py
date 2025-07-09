@@ -25,14 +25,16 @@ ExpertUID: TypeAlias = str
 # Check for the fused Triton kernel once at module load time for efficiency.
 # This avoids repeated import attempts in the hot path of inference.
 try:
-    from agentgrid.server.kernels import update_cache_fused
+    from agentgrid.server.kernels import update_cache_fused, reorder_cache_fused
 
-    HAS_FUSED_KERNEL = True
-    logger.info("Triton fused kernel for cache update is available and will be used.")
+    HAS_FUSED_UPDATE_KERNEL = True
+    HAS_FUSED_REORDER_KERNEL = True
+    logger.info("Triton fused kernels for cache update and reorder are available and will be used.")
 except ImportError:
-    HAS_FUSED_KERNEL = False
+    HAS_FUSED_UPDATE_KERNEL = False
+    HAS_FUSED_REORDER_KERNEL = False
     logger.warning(
-        "Triton fused kernel for cache update not available. "
+        "Triton fused kernels not available. "
         "Falling back to slower python-level implementation. "
         "For performance, install Triton (`pip install triton`)."
     )
@@ -74,9 +76,25 @@ class AgentGridCache(Cache):
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
         """Reorders the cache for beam search, given the selected beam indices."""
-        # In-place reorder cache by beam indices
-        for cache_tensor in self.tensors:
-            cache_tensor[...] = cache_tensor[beam_idx.to(cache_tensor.device)]
+        if HAS_FUSED_REORDER_KERNEL:
+            # Fuse reordering for all shards on the same device
+            shards_by_device = {}
+            for i in range(self.num_shards):
+                key_cache_shard = self.tensors[i * 2]
+                value_cache_shard = self.tensors[i * 2 + 1]
+                device = key_cache_shard.device
+                if device not in shards_by_device:
+                    shards_by_device[device] = []
+                shards_by_device[device].append((key_cache_shard, value_cache_shard))
+
+            for device, shards in shards_by_device.items():
+                device_beam_idx = beam_idx.to(device)
+                for key_cache_shard, value_cache_shard in shards:
+                    reorder_cache_fused(key_cache_shard, value_cache_shard, device_beam_idx)
+        else:
+            # Fallback to the original implementation
+            for cache_tensor in self.tensors:
+                cache_tensor[...] = cache_tensor[beam_idx.to(cache_tensor.device)]
 
     def update(
         self,
@@ -132,7 +150,7 @@ class AgentGridCache(Cache):
             key_state_shard = key_state_shards[i]
             value_state_shard = value_state_shards[i]
 
-            if HAS_FUSED_KERNEL:
+            if HAS_FUSED_UPDATE_KERNEL:
                 update_cache_fused(
                     key_cache_shard, value_cache_shard, key_state_shard, value_state_shard, prefix_length
                 )

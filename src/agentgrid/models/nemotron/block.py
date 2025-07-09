@@ -24,6 +24,12 @@ from agentgrid.models.nemotron.block_config import AttentionConfig
 
 from hivemind import get_logger
 
+try:
+    from agentgrid.models.nemotron.kernels import apply_rotary_pos_emb_fused
+    HAS_FUSED_ROPE_KERNEL = True
+except ImportError:
+    HAS_FUSED_ROPE_KERNEL = False
+
 logger = get_logger(__name__)
 
 class BaseNemotronAttention:
@@ -80,7 +86,10 @@ class OptimizedNemotronAttention(DeciLMAttention, BaseNemotronAttention):
             #cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
         if q_len == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
-            query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
+            if HAS_FUSED_ROPE_KERNEL:
+                query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, cos, sin)
+            else:
+                query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -166,7 +175,10 @@ class OptimizedNemotronFlashAttention2(DeciLMFlashAttention2, BaseNemotronAttent
             #cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
         if q_len == 1 and torch.is_inference_mode_enabled() and hidden_states.device.type == "cuda":
-            query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
+            if HAS_FUSED_ROPE_KERNEL:
+                query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, cos, sin)
+            else:
+                query_states, key_states = self._optimized_apply_rotary(query_states, key_states, cos, sin)
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
