@@ -11,6 +11,7 @@ from hivemind.utils import get_logger
 from tensor_parallel import TensorParallel
 from tensor_parallel.per_device_tensors import PerDeviceTensors
 from transformers import PretrainedConfig
+from transformers.cache_utils import Cache
 
 from agentgrid.data_structures import InferenceMetadata
 from agentgrid.server.memory_cache import MemoryCache
@@ -20,6 +21,74 @@ from agentgrid.utils.misc import get_size_in_bytes, is_dummy
 logger = get_logger(__name__)
 
 ExpertUID: TypeAlias = str
+
+
+class AgentGridCache(Cache):
+    """
+    A cache that uses agentgrid's MemoryCache for storing KV cache tensors.
+    """
+
+    def __init__(
+        self,
+        tensors: Sequence[torch.Tensor],
+        max_length: int,
+        num_shards: int,
+    ):
+        super().__init__()
+        self.tensors = tensors
+        self.max_length = max_length
+        self.num_shards = num_shards
+        self._seq_length = 0
+
+    def select_layer_past(self, prefix_length: int) -> Sequence[torch.Tensor]:
+        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
+        self._seq_length = prefix_length
+        key_cache, value_cache = list(self.tensors[0::2]), list(self.tensors[1::2])
+        for i in range(len(key_cache)):
+            key_cache[i] = key_cache[i][:, :, :prefix_length, :]
+            value_cache[i] = value_cache[i][:, :, :prefix_length, :]
+        layer_past = tuple(chain(*zip(key_cache, value_cache)))
+        return PerDeviceTensors(*layer_past) if self.num_shards > 1 else layer_past
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states."""
+        return self._seq_length
+
+    def get_max_length(self) -> Optional[int]:
+        """Returns the maximum sequence length of the cached states."""
+        return self.max_length
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorders the cache for beam search, given the selected beam indices."""
+        # In-place reorder cache by beam indices
+        for cache_tensor in self.tensors:
+            cache_tensor[...] = cache_tensor[beam_idx.to(cache_tensor.device)]
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+        """
+        if cache_kwargs is None:
+            cache_kwargs = {}
+        prefix_length = cache_kwargs.get("prefix_length", 0)
+
+        key_cache_tensor = self.tensors[2 * layer_idx]
+        value_cache_tensor = self.tensors[2 * layer_idx + 1]
+
+        new_length = key_states.shape[2]
+        self._seq_length = new_length
+
+        key_cache_tensor[:, :, prefix_length:new_length, :] = key_states[:, :, prefix_length:new_length, :]
+        value_cache_tensor[:, :, prefix_length:new_length, :] = value_states[:, :, prefix_length:new_length, :]
+
+        return key_states, value_states
+
 
 class TransformerBackend(ModuleBackend):
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
@@ -153,11 +222,14 @@ class TransformerBackend(ModuleBackend):
         with self.memory_cache.use_cache(
             *inference_info.cache_handles
         ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter):
+            max_length = cache_tensors[0].shape[2]  # Get max_length from the cache tensor shape
+            cache = AgentGridCache(cache_tensors, max_length, len(self.module.module_shards))
             # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
             # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
             # is at least 4-6x less than `autograd_memory`.
             max_chunk_length = self._estimate_max_chunk_length(hidden_states, inference_info)
-            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length)
+            layer_past = cache.select_layer_past(inference_info.prefix_length)
+            new_kvs = None
 
             if seq_len <= max_chunk_length:
                 output_hidden_states, new_kvs = self.module.forward(
@@ -183,7 +255,18 @@ class TransformerBackend(ModuleBackend):
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     layer_past = new_kvs
 
-            self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length)
+            if new_kvs is not None and len(new_kvs) > 0:
+                num_layers = len(new_kvs) // 2
+                for i in range(num_layers):
+                    key_states = new_kvs[i * 2]
+                    value_states = new_kvs[i * 2 + 1]
+                    cache.update(
+                        key_states,
+                        value_states,
+                        i,
+                        cache_kwargs={"prefix_length": inference_info.prefix_length},
+                    )
+
             return (output_hidden_states,)
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
@@ -201,27 +284,6 @@ class TransformerBackend(ModuleBackend):
         if not is_dummy(hypo_ids):
             for cache_tensor in cache_tensors:
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
-
-    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Sequence[torch.Tensor]:
-        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
-        key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
-        for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i][:, :, :prefix_length, :]
-            value_cache[i] = value_cache[i][:, :, :prefix_length, :]
-
-        layer_past = tuple(chain(*zip(key_cache, value_cache)))
-        return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
-
-    def _update_cache_inplace(
-        self, cache_tensors: Sequence[torch.Tensor], new_kvs: Sequence[torch.Tensor], prefix_length: int
-    ):
-        """Writes new key/value tensors back into cache, works in-place"""
-        if not new_kvs:
-            return
-
-        new_length = new_kvs[0].shape[2]
-        for i in range(len(new_kvs)):
-            cache_tensors[i][:, :, prefix_length:new_length, :] = new_kvs[i][:, :, prefix_length:new_length, :]
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         return self.forward_pool, self.backward_pool, self.inference_pool
