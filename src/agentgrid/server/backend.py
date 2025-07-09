@@ -22,6 +22,20 @@ logger = get_logger(__name__)
 
 ExpertUID: TypeAlias = str
 
+# Check for the fused Triton kernel once at module load time for efficiency.
+# This avoids repeated import attempts in the hot path of inference.
+try:
+    from agentgrid.server.kernels import update_cache_fused
+
+    HAS_FUSED_KERNEL = True
+    logger.info("Triton fused kernel for cache update is available and will be used.")
+except ImportError:
+    HAS_FUSED_KERNEL = False
+    logger.warning(
+        "Triton fused kernel for cache update not available. "
+        "Falling back to slower python-level implementation. "
+        "For performance, install Triton (`pip install triton`)."
+    )
 
 class AgentGridCache(Cache):
     """
@@ -95,14 +109,6 @@ class AgentGridCache(Cache):
         It attempts to use a fused Triton kernel for performance and falls back to
         a standard PyTorch implementation if the kernel is unavailable.
         """
-        try:
-            from agentgrid.server.kernels import update_cache_fused
-
-            use_fused_kernel = True
-        except ImportError:
-            logger.warning("Triton kernel not found. Falling back to python-level cache update.")
-            use_fused_kernel = False
-
         if isinstance(key_states, PerDeviceTensors):
             key_state_shards = key_states.tensor_shards
             value_state_shards = value_states.tensor_shards
@@ -126,7 +132,7 @@ class AgentGridCache(Cache):
             key_state_shard = key_state_shards[i]
             value_state_shard = value_state_shards[i]
 
-            if use_fused_kernel:
+            if HAS_FUSED_KERNEL:
                 update_cache_fused(
                     key_cache_shard, value_cache_shard, key_state_shard, value_state_shard, prefix_length
                 )
