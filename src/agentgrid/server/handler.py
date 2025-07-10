@@ -31,7 +31,7 @@ from hivemind.utils.streaming import split_for_streaming
 import agentgrid
 from agentgrid.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, ModuleUID
 from agentgrid.server.backend import TransformerBackend
-from agentgrid.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
+from agentgrid.server.block_functions import iterate_rpc_inference, run_rpc_forward
 from agentgrid.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from agentgrid.utils.convert_block import QuantType
 
@@ -432,61 +432,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             for result, proto, compression in zip([hidden_states], outputs_schema, output_compression)
         ]
 
-    async def rpc_backward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
-        async with timeout(self.request_timeout):
-            # Parse requests and prepare backends
-            flat_tensors = [deserialize_torch_tensor(tensor) for tensor in request.tensors]
-            requested_uids = self._check_uids(request.uid)
-            self._log_request("rpc_backward", requested_uids, context)
-
-            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            args_structure = metadata.get("args_structure")
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_backward should have number of points as number or None, got {points}"
-
-            grads = await run_rpc_backward(
-                *flat_tensors,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
-                args_structure=args_structure,
-            )
-
-            return runtime_pb2.ExpertResponse(tensors=self._serialize_grads(grads, requested_backends, metadata))
-
-    async def rpc_backward_stream(
-        self, requests: AsyncIterator[runtime_pb2.ExpertRequest], context: P2PContext
-    ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
-        async with timeout(self.request_timeout):
-            uids_header, flat_tensors, metadata = await self._gather_inputs(requests, context)
-            requested_uids = self._check_uids(uids_header)
-            self._log_request("rpc_backward_stream", requested_uids, context)
-
-            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            args_structure = metadata.get("args_structure")
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_backward_stream should have number of points as number or None, got {points}"
-
-            grads = await run_rpc_backward(
-                *flat_tensors,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
-                args_structure=args_structure,
-            )
-            # Split the serialized_grad_inputs for streaming and respond
-            for tensor in self._serialize_grads(grads, requested_backends, metadata):
-                for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
-                    yield runtime_pb2.ExpertResponse(tensors=[part])
+    
 
     def _get_active_adapter(self, metadata: dict) -> str:
         active_adapter = metadata.get("active_adapter", "")
@@ -494,31 +440,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             raise KeyError(f"adapter {active_adapter} not found")
         return active_adapter
 
-    def _serialize_grads(
-        self,
-        grads: Sequence[torch.Tensor],
-        requested_backends: Sequence[TransformerBackend],
-        metadata: Dict[str, Any],
-    ) -> Sequence[runtime_pb2.Tensor]:
-        """Serialize backward gradients w.r.t. inputs using either default schema or custom user-specified schema"""
-        # Modify grad_inputs_schema to support grad_prompts
-        assert len(requested_backends[0].args_schema) == 1 and len(grads) in (1, 2)  # TODO generalize
-        flat_grads_schema = tuple(
-            nested_flatten((requested_backends[0].args_schema * len(grads), requested_backends[0].kwargs_schema))
-        )  # TODO generalize
-
-        if metadata.get("output_compression") is not None:
-            assert isinstance(metadata["output_compression"], (list, tuple)), "output_compression must be a tuple/list"
-            output_compression = tuple(metadata["output_compression"])
-            assert all(isinstance(c, int) for c in output_compression), "output_compression must contain integers"
-            assert len(output_compression) == len(grads), f"output_compression should have {len(grads)} elements"
-        else:
-            output_compression = tuple(tensor.compression for tensor in flat_grads_schema)
-
-        return [
-            serialize_torch_tensor(result.to(proto.dtype), compression, allow_inplace=True)
-            for result, proto, compression in zip(grads, flat_grads_schema, output_compression)
-        ]
+    
 
     def _check_uids(self, uids: str) -> Tuple[ModuleUID, ...]:
         """Check that the first request to rpc_inference is valid"""

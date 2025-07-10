@@ -199,9 +199,7 @@ class TransformerBackend(ModuleBackend):
         self.forward_pool = PrioritizedTaskPool(
             self.forward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_forward"
         )
-        self.backward_pool = PrioritizedTaskPool(
-            self.backward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_backward"
-        )
+        
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
@@ -269,10 +267,7 @@ class TransformerBackend(ModuleBackend):
         with self._peft_module.using_adapter(active_adapter):
             return super().forward(*inputs)
 
-    def backward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
-        *inputs, active_adapter = inputs
-        with self._peft_module.using_adapter(active_adapter):
-            return super().backward(*inputs)
+    
 
     @torch.inference_mode()
     def inference_step(
@@ -345,7 +340,7 @@ class TransformerBackend(ModuleBackend):
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
-        return self.forward_pool, self.backward_pool, self.inference_pool
+        return self.forward_pool, self.inference_pool
 
     def get_info(self) -> Dict[str, Any]:
         """Get module parameters and stats. Used by RemoteExpert to check shapes and for DMoE orchestration."""
@@ -353,7 +348,7 @@ class TransformerBackend(ModuleBackend):
 
     def shutdown(self):
         # Break the cyclic references, otherwise TransformerBackend may be not garbage-collected
-        self.forward_pool = self.backward_pool = self.inference_pool = None
+        self.forward_pool = self.inference_pool = None
 
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons
@@ -398,8 +393,18 @@ class _MergedInferenceStep:
         assert isinstance(position_embeddings, tuple), "expected position_embeddings to be a tuple"
 
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
-            if optional_prompt is not None:
-                hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
+            if isinstance(optional_prompt, tuple) and optional_prompt:
+                # TODO: this is a hack, find out why prompts are wrapped in a tuple
+                optional_prompt = optional_prompt[0]
+
+            if optional_prompt is not None and optional_prompt.numel() > 0:
+                prompt_to_add = optional_prompt
+                while prompt_to_add.ndim < hidden_states.ndim:
+                    prompt_to_add = prompt_to_add.unsqueeze(0)
+
+                prompt_len = prompt_to_add.shape[1]
+                hidden_states[:, :prompt_len] += prompt_to_add
+
             outputs = self.backends[inference_info.uid].inference_step(
                 hidden_states, attention_mask, position_ids, position_embeddings, inference_info
             )

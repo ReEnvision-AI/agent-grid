@@ -319,8 +319,7 @@ class Server:
             total_memory = psutil.virtual_memory().total
 
         gib = 1024**3
-        # Estimate of GPU memory used in rpc_backward (2 GiB for BLOOM, proportional for other models)
-        autograd_memory = 2 * gib * num_devices / 14336 * self.block_config.hidden_size
+        autograd_memory = 0  # Removed backward pass, so autograd_memory is 0
 
         avg_block_size = self._get_avg_block_size_in_bytes()
         total_memory_per_block = avg_block_size + self._cache_bytes_per_block

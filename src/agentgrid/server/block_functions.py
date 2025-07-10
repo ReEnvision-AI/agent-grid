@@ -3,7 +3,7 @@ This module implements server-side computations on served blocks: forward, backw
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
@@ -25,15 +25,23 @@ def _prepare_prompts(prompts: torch.Tensor, requested_backends: Sequence[Transfo
     """Prepare prompts for use in forward and backward passes."""
     if prompts is None or is_dummy(prompts):
         return [DUMMY] * len(requested_backends)
-    else:
-        return [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
+    if prompts.shape[0] != len(requested_backends):
+        raise ValueError(f"Received {prompts.shape[0]} prompts for {len(requested_backends)} backends")
+    split_prompts = prompts.to(requested_backends[0].dtype).split(1, dim=0)
+    prepared = []
+    for p in split_prompts:
+        p = p.squeeze(0)
+        if p.ndim == 2:
+            p = p.unsqueeze(0)  # Assume batch=1 if missing batch dim
+        prepared.append(p)
+    return prepared
 
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
-# TODO: Increase the NF4 threshold once bitsandbytes ships efficient NF4 kernel for parallel forward
 MAX_SHORT_INFERENCE_TOKENS = 128
-MAX_NF4_SHORT_INFERENCE_TOKENS = 1
+# Updated based on bitsandbytes 0.45.0+ performance improvements for NF4
+MAX_NF4_SHORT_INFERENCE_TOKENS = 128
 
 logger = get_logger(__name__)
 
@@ -67,17 +75,28 @@ async def run_rpc_forward(
     dtype = requested_backends[0].dtype
     # check parse input tensors and cast dtypes
     hidden_states = hidden_states.to(dtype)
-    assert hidden_states.ndim == 3
+    if hidden_states.ndim != 3:
+        raise ValueError(f"Hidden states must be a 3D tensor, got shape {hidden_states.shape}")
     prompts = _prepare_prompts(prompts, requested_backends)
 
     # Run a chain of requested backends
-    for backend, prompt in zip(requested_backends, prompts):
+    point_per_backend = points / len(requested_backends) if len(requested_backends) > 0 else 0
+    for i, (backend, prompt) in enumerate(zip(requested_backends, prompts)):
         if not is_dummy(prompt):
-            hidden_states[:, : prompt.shape[1]] += prompt
+            if prompt.ndim < 2:
+                logger.warning(f"Skipping prompt addition due to invalid ndim {prompt.ndim}")
+                continue
+            prompt_len = prompt.shape[-2]
+            try:
+                hidden_states[:, :prompt_len] += prompt
+            except RuntimeError as e:
+                logger.error(f"Shape mismatch in prompt addition: hidden {hidden_states.shape}, prompt {prompt.shape}, error: {e}")
 
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "agentgrid support only prioritized pools"
+        if not isinstance(backend.inference_pool, PrioritizedTaskPool):
+            raise ValueError("agentgrid supports only prioritized pools")
+        # TODO: For better perf, make point_per_backend non-uniform based on profiled layer costs
         priority = prioritizer.prioritize(
-            hidden_states, points=points / len(requested_backends), backend=backend, type="forward"
+            hidden_states, points=point_per_backend, backend=backend, type="forward"
         )
         (hidden_states,) = await backend.forward_pool.submit_task(
             hidden_states,
@@ -88,69 +107,13 @@ async def run_rpc_forward(
             active_adapter,
             priority=priority,
         )
-        assert isinstance(hidden_states, torch.Tensor)
-        assert (
-            hidden_states.ndim == 3
-        ), f"inputs to {type(backend)} must be a list with a single 3d tensor of hidden states"
+        if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 3:
+            raise ValueError(f"Output from {type(backend)} must be a single 3D tensor")
 
     return hidden_states
 
 
-async def run_rpc_backward(
-    *flat_tensors: torch.Tensor,
-    requested_backends: Sequence[TransformerBackend],
-    active_adapter: str = "",
-    prioritizer: TaskPrioritizerBase,
-    points: int = 0,
-    args_structure: Any = None,
-) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
-    if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-        flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
-    inputs, grad_outputs, prompts, *_ = flat_tensors
 
-    # Cast inputs & grad outputs to backend dtype
-    inputs = inputs.to(requested_backends[0].dtype)
-    grad_outputs = grad_outputs.to(requested_backends[-1].dtype)
-
-    prompts = _prepare_prompts(prompts, requested_backends)
-
-    # Run a forward chain to collect intermediate inputs
-    # Note that we do not forward for the last module since we do not need its output
-    inter_inputs = []
-    for backend, prompt in zip(requested_backends[:-1], prompts[:-1]):
-        assert inputs.ndim == 3, f"inputs to {type(backend)} must be a single 3d tensor of hidden states"
-        if not is_dummy(prompt):
-            inputs[:, : prompt.shape[1]] += prompt
-        inter_inputs.append(inputs)
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "agentgrid support only prioritized pools"
-        priority = prioritizer.prioritize(
-            inputs, points=points / len(requested_backends), backend=backend, type="forward_in_backward"
-        )
-        (inputs,) = await backend.forward_pool.submit_task(inputs, active_adapter, priority=priority)
-
-        assert isinstance(inputs, torch.Tensor)
-
-    if not is_dummy(prompts[-1]):
-        inputs[:, : prompts[-1].shape[1]] += prompts[-1]
-    inter_inputs.append(inputs)
-
-    assert len(inter_inputs) == len(prompts) == len(requested_backends), "internal shape error during backward"
-    grad_prompts_reversed = []
-    # Run a chain of requested backends
-    for inp, prompt, backend in zip(*map(reversed, (inter_inputs, prompts, requested_backends))):
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "agentgrid support only prioritized pools"
-        priority = prioritizer.prioritize(
-            inp, grad_outputs, points=points / len(requested_backends), backend=backend, type="backward"
-        )
-        (grad_outputs,) = await backend.backward_pool.submit_task(inp, grad_outputs, active_adapter, priority=priority)
-
-        assert isinstance(grad_outputs, torch.Tensor)
-        if not is_dummy(prompt):
-            grad_prompts_reversed.append(grad_outputs[:, : prompt.shape[1]].unsqueeze(0))
-
-    grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else DUMMY
-    return [grad_outputs] if is_dummy(grad_prompts) else [grad_outputs, grad_prompts]  # TODO un-duct-tape
 
 
 async def iterate_rpc_inference(
@@ -166,7 +129,8 @@ async def iterate_rpc_inference(
     quant_type: QuantType,
     args_structure: Any = None,
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
-    assert len(cache_handles) == len(requested_backends)
+    if len(cache_handles) != len(requested_backends):
+        raise ValueError(f"Cache handles length {len(cache_handles)} != backends {len(requested_backends)}")
 
     prefix_length = 0
     point_per_piece = points / max_length if max_length > 0 else 0.0
@@ -174,21 +138,21 @@ async def iterate_rpc_inference(
     async for request, step_metadata in input_iterator:
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
-            assert (
-                prefix_length >= start_from_position,
-            ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
+            if prefix_length < start_from_position:
+                raise ValueError(f"prefix_length={prefix_length} < start_from_position={start_from_position}")
             prefix_length = start_from_position
 
         flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         if args_structure is not None:
-            # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-            flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+            unpacked_args, unpacked_kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+        else:
+            unpacked_args, unpacked_kwargs = flat_tensors, {}
 
-        hidden_states = flat_tensors[0]
-        prompts = flat_tensors[1]
-        attention_mask = flat_tensors[2]
-        position_ids = flat_tensors[3]
-        position_embeddings = flat_tensors[4]
+        hidden_states = unpacked_args[0]
+        prompts = unpacked_args[1]
+        attention_mask = unpacked_args[2]
+        position_ids = unpacked_args[3]
+        position_embeddings = unpacked_args[4]
         batch_size, length_increment, _ = hidden_states.shape
 
         # Cast inputs to backend dtype
@@ -196,13 +160,9 @@ async def iterate_rpc_inference(
 
         # parse deep prompts (optional argument)
         if prompts is None or is_dummy(prompts):
-            prompts = [None] * len(requested_backends)
+            prompts = [DUMMY] * len(requested_backends)
         else:
-            prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
-            prompts = [prompt if not is_dummy(prompt) else None for prompt in prompts]
-
-        if not (len(requested_backends) == len(prompts)):
-            raise ValueError(f"Received {len(prompts)} prompts for {len(requested_backends)} backends")
+            prompts = _prepare_prompts(prompts, requested_backends)
 
         if prefix_length + length_increment > max_length:
             raise ValueError(
@@ -222,7 +182,8 @@ async def iterate_rpc_inference(
         # A client may pass a tensor with 0 tokens. This is a special case that occurs, e.g.
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
-            assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
+            if hidden_states.ndim != 3:
+                raise ValueError(f"Hidden states must be a single 3D tensor, got {hidden_states.shape}")
             if can_merge_pools:
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
