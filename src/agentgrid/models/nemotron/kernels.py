@@ -1,8 +1,7 @@
 
 import torch
 import triton
-import triton.language as tl
-
+import triton.language as tl 
 
 @triton.jit
 def _apply_rope_kernel(
@@ -47,35 +46,72 @@ def _apply_rope_kernel(
     tl.store(out_ptr + h2_offsets, out_h2)
 
 
+def _apply_rope_pytorch(
+    t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """
+    Applies rotary position embedding to a tensor using PyTorch.
+    t: [bsz, num_heads, seq_len, head_dim]
+    cos, sin: [bsz, seq_len, head_dim]
+    """
+    cos = cos.unsqueeze(1)  # [bsz, 1, seq_len, head_dim]
+    sin = sin.unsqueeze(1)  # [bsz, 1, seq_len, head_dim]
+
+    half_head_dim = t.shape[-1] // 2
+    t_h1 = t[..., :half_head_dim]
+    t_h2 = t[..., half_head_dim:]
+
+    cos_h1 = cos[..., :half_head_dim]
+    sin_h1 = sin[..., :half_head_dim]
+
+    out_h1 = t_h1 * cos_h1 - t_h2 * sin_h1
+    out_h2 = t_h2 * cos_h1 + t_h1 * sin_h1
+
+    return torch.cat([out_h1, out_h2], dim=-1)
+
+
 def apply_rotary_pos_emb_fused(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Applies rotary position embedding to q and k tensors using a fused Triton kernel.
+    Applies rotary position embedding to q and k tensors.
+    Uses a fused Triton kernel on compatible GPUs (Ampere and newer), otherwise falls back to a PyTorch implementation.
     """
-    bsz, num_q_heads, seq_len, head_dim = q.shape
-    _, num_k_heads, _, _ = k.shape
-    
-    q_out = torch.empty_like(q)
-    k_out = torch.empty_like(k)
+    # The Triton kernel is only compatible with newer CUDA architectures (compute capability >= 8.0).
+    use_triton_kernel = False
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            use_triton_kernel = True
 
-    grid_q = (bsz, num_q_heads, seq_len)
-    grid_k = (bsz, num_k_heads, seq_len)
+    if use_triton_kernel:
+        bsz, num_q_heads, seq_len, head_dim = q.shape
+        _, num_k_heads, _, _ = k.shape
+        
+        q_out = torch.empty_like(q)
+        k_out = torch.empty_like(k)
 
-    half_head_dim = head_dim // 2
+        grid_q = (bsz, num_q_heads, seq_len)
+        grid_k = (bsz, num_k_heads, seq_len)
 
-    _apply_rope_kernel[grid_q](
-        q, cos, sin, q_out,
-        q.stride(0), q.stride(1), q.stride(2),
-        cos.stride(0), cos.stride(1),
-        sin.stride(0), sin.stride(1),
-        head_dim=head_dim,
-        half_head_dim=half_head_dim,
-    )
-    _apply_rope_kernel[grid_k](
-        k, cos, sin, k_out,
-        k.stride(0), k.stride(1), k.stride(2),
-        cos.stride(0), cos.stride(1),
-        sin.stride(0), sin.stride(1),
-        head_dim=head_dim,
-        half_head_dim=half_head_dim,
-    )
-    return q_out, k_out
+        half_head_dim = head_dim // 2
+
+        _apply_rope_kernel[grid_q](
+            q, cos, sin, q_out,
+            q.stride(0), q.stride(1), q.stride(2),
+            cos.stride(0), cos.stride(1),
+            sin.stride(0), sin.stride(1),
+            head_dim=head_dim,
+            half_head_dim=half_head_dim,
+        )
+        _apply_rope_kernel[grid_k](
+            k, cos, sin, k_out,
+            k.stride(0), k.stride(1), k.stride(2),
+            cos.stride(0), cos.stride(1),
+            sin.stride(0), sin.stride(1),
+            head_dim=head_dim,
+            half_head_dim=half_head_dim,
+        )
+        return q_out, k_out
+    else:
+        q_out = _apply_rope_pytorch(q, cos, sin)
+        k_out = _apply_rope_pytorch(k, cos, sin)
+        return q_out, k_out

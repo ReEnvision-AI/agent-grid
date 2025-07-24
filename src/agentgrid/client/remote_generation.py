@@ -95,12 +95,12 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             context_manager = contextlib.nullcontext(self.active_session)
         else:
             # If there's no active session, create a new one
-            max_length = kwargs.get("max_length")
-            max_new_tokens = kwargs.get("max_new_tokens")
-            assert (max_length is None) != (
-                max_new_tokens is None
-            ), "You should set `max_length` or `max_new_tokens` (but not both) to reserve server-side attention caches"
-
+            generation_config = kwargs.get("generation_config", None)
+            max_length = generation_config.max_length if generation_config else kwargs.get("max_length")
+            max_new_tokens = generation_config.max_new_tokens if generation_config else kwargs.get("max_new_tokens")
+            #assert (max_length is None) != (
+            #    max_new_tokens is None
+            #), "You should set `max_length` or `max_new_tokens` (but not both) to reserve server-side attention caches"
             session_max_length = self.transformer.config.pre_seq_len
             if max_length is not None:
                 session_max_length += max_length

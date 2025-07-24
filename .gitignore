@@ -132,3 +132,5 @@ dmypy.json
 scripts/
 
 .vscode/
+
+scripts/

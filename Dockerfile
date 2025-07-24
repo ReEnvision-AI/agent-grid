@@ -1,6 +1,7 @@
+ARG BUILDER_IMAGE="ghcr.io/reenvision-ai/base-image:1.1.0"
 #FROM nvcr.io/nvidia/cuda:11.0.3-cudnn8-devel-ubuntu20.04
 #FROM nvcr.io/nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS builder
-FROM ghcr.io/reenvision-ai/base-flash-image:1.0.0 AS builder
+FROM ${BUILDER_IMAGE} AS builder
 LABEL maintainer="ReEnvision-AI"
 LABEL repository="agent-grid"
 LABEL org.opencontainers.image.source="https://github.com/ReEnvision-AI/agent-grid"
@@ -27,7 +28,7 @@ RUN pip install --no-cache-dir -e .
 COPY . /home/agent-grid/
 
 # --- Runtime Stage ---
-FROM nvcr.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvcr.io/nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 LABEL maintainer="ReEnvision-AI"
 LABEL repository="agent-grid"

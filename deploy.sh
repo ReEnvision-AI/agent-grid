@@ -5,6 +5,11 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+# --- Configuration ---
+
+# Default value for WITH_FLASH, can be overridden by command-line argument
+WITH_FLASH=${1:-"false"}
+
 # --- Main Script ---
 
 echo "Starting deployment script..."
@@ -33,8 +38,19 @@ VERSION=${AGENT_GRID_VERSION:-"1.0.0"}
 echo "Building Agent Grid container version $VERSION"
 
 IMAGE_NAME="ghcr.io/reenvision-ai/agent-grid"
-IMAGE_WITH_VERSION="${IMAGE_NAME}:${VERSION}"
-LATEST_IMAGE="${IMAGE_NAME}:latest"
+
+# Set the builder image and image name based on WITH_FLASH
+if [ "$WITH_FLASH" = "true" ]; then
+    echo "Building with Flash Attention"
+    BUILDER_IMAGE="ghcr.io/reenvision-ai/base-image:1.1.0-flash"
+    IMAGE_WITH_VERSION="${IMAGE_NAME}:${VERSION}-flash"
+    LATEST_IMAGE="${IMAGE_NAME}:latest-flash"
+else
+    echo "Building without Flash Attention"
+    BUILDER_IMAGE="ghcr.io/reenvision-ai/base-image:1.1.0"
+    IMAGE_WITH_VERSION="${IMAGE_NAME}:${VERSION}"
+    LATEST_IMAGE="${IMAGE_NAME}:latest"
+fi
 
 # Login to Github Container Registry using podman
 echo "Logging into ghcr.io..."
@@ -42,7 +58,7 @@ echo "$CR_PAT" | podman login ghcr.io -u "$CR_USER" --password-stdin
 
 # Build the image with podman
 echo "Building image: $IMAGE_WITH_VERSION"
-podman build -t "$IMAGE_WITH_VERSION" .
+podman build --build-arg BUILDER_IMAGE="$BUILDER_IMAGE" -t "$IMAGE_WITH_VERSION" .
 
 # Push the image to the registry
 echo "Pushing image: $IMAGE_WITH_VERSION"
