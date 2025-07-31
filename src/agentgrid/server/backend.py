@@ -11,7 +11,7 @@ from hivemind.utils import get_logger
 from tensor_parallel import TensorParallel
 from tensor_parallel.per_device_tensors import PerDeviceTensors
 from transformers import PretrainedConfig
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, CacheLayerMixin
 
 from agentgrid.data_structures import InferenceMetadata
 from agentgrid.server.memory_cache import MemoryCache
@@ -39,127 +39,84 @@ except ImportError:
         "For performance, install Triton (`pip install triton`)."
     )
 
-class AgentGridCache(Cache):
-    """
-    A cache that uses agentgrid's MemoryCache for storing KV cache tensors.
-    """
+class AgentGridLayer(CacheLayerMixin):
+    def __init__(self, key_shards: Sequence[torch.Tensor] = None, value_shards: Sequence[torch.Tensor] = None):
+        self.key_shards = key_shards
+        self.value_shards = value_shards
 
-    def __init__(
-        self,
-        tensors: Sequence[torch.Tensor],
-        max_length: int,
-        num_shards: int,
-    ):
-        super().__init__()
-        self.tensors = tensors
-        self.max_length = max_length
-        self.num_shards = num_shards
-        self._seq_length = 0
+    @property
+    def keys(self) -> PerDeviceTensors:
+        return PerDeviceTensors(*self.key_shards)
 
-    def select_layer_past(self, prefix_length: int) -> Sequence[torch.Tensor]:
-        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
-        self._seq_length = prefix_length
-        key_cache, value_cache = list(self.tensors[0::2]), list(self.tensors[1::2])
-        for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i][:, :, :prefix_length, :]
-            value_cache[i] = value_cache[i][:, :, :prefix_length, :]
-        layer_past = tuple(chain(*zip(key_cache, value_cache)))
-        return PerDeviceTensors(*layer_past) if self.num_shards > 1 else layer_past
+    @property
+    def values(self) -> PerDeviceTensors:
+        return PerDeviceTensors(*self.value_shards)
 
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """Returns the sequence length of the cached states."""
-        return self._seq_length
+    def update(self, key_states: PerDeviceTensors, value_states: PerDeviceTensors, cache_kwargs: Optional[Dict[str, Any]] = None) -> Tuple[PerDeviceTensors, PerDeviceTensors]:
+        prefix_length = (cache_kwargs or {}).get("prefix_length", 0)
+        new_length = key_states.shape[2]
 
-    def get_max_length(self) -> Optional[int]:
-        """Returns the maximum sequence length of the cached states."""
-        return self.max_length
+        key_state_shards = getattr(key_states, "tensor_shards", [key_states])
+        value_state_shards = getattr(value_states, "tensor_shards", [value_states])
+
+        for i in range(len(self.key_shards)):
+            key_cache_shard = self.key_shards[i]
+            value_cache_shard = self.value_shards[i]
+            key_state_shard = key_state_shards[i]
+            value_state_shard = value_state_shards[i]
+
+            if prefix_length < new_length:
+                update_slice = slice(prefix_length, new_length)
+                key_cache_shard[:, :, update_slice, :] = key_state_shard[:, :, update_slice, :]
+                value_cache_shard[:, :, update_slice, :] = value_state_shard[:, :, update_slice, :]
+        return self.keys, self.values
+
+    def get_seq_length(self, cache_position=None) -> int:
+        return self.keys.shape[2]
+
+    def get_max_cache_shape(self) -> int:
+        return self.keys.shape[2]
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorders the cache for beam search, given the selected beam indices."""
         if HAS_FUSED_REORDER_KERNEL:
-            # Fuse reordering for all shards on the same device
             shards_by_device = {}
-            for i in range(self.num_shards):
-                key_cache_shard = self.tensors[i * 2]
-                value_cache_shard = self.tensors[i * 2 + 1]
-                device = key_cache_shard.device
+            for key_shard, value_shard in zip(self.key_shards, self.value_shards):
+                device = key_shard.device
                 if device not in shards_by_device:
                     shards_by_device[device] = []
-                shards_by_device[device].append((key_cache_shard, value_cache_shard))
+                shards_by_device[device].append((key_shard, value_shard))
 
             for device, shards in shards_by_device.items():
                 device_beam_idx = beam_idx.to(device)
                 for key_cache_shard, value_cache_shard in shards:
                     reorder_cache_fused(key_cache_shard, value_cache_shard, device_beam_idx)
         else:
-            # Fallback to the original implementation
-            for cache_tensor in self.tensors:
-                cache_tensor[...] = cache_tensor[beam_idx.to(cache_tensor.device)]
+            for key_shard, value_shard in zip(self.key_shards, self.value_shards):
+                key_shard[...] = key_shard[beam_idx.to(key_shard.device)]
+                value_shard[...] = value_shard[beam_idx.to(value_shard.device)]
 
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
-        This method is kept for API compatibility with transformers.Cache but the main update logic
-        for this backend is in `update_sharded`.
-        """
-        # This method is not expected to be called in the current agentgrid flow,
-        # but is implemented for correctness and compatibility.
-        prefix_length = (cache_kwargs or {}).get("prefix_length", self._seq_length)
-        self.update_sharded(
-            PerDeviceTensors(key_states), PerDeviceTensors(value_states), prefix_length=prefix_length
-        )
-        return key_states, value_states
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        return self.get_seq_length(), 0
 
-    def update_sharded(
-        self,
-        key_states: Union[PerDeviceTensors, torch.Tensor],
-        value_states: Union[PerDeviceTensors, torch.Tensor],
-        prefix_length: int,
-    ):
-        """
-        Updates the sharded cache tensors in-place using the new key-value states.
-        It attempts to use a fused Triton kernel for performance and falls back to
-        a standard PyTorch implementation if the kernel is unavailable.
-        """
-        if isinstance(key_states, PerDeviceTensors):
-            key_state_shards = key_states.tensor_shards
-            value_state_shards = value_states.tensor_shards
-            new_length = key_states.shape[2]
-        else:
-            # Handle the case of a single, non-sharded tensor
-            key_state_shards = [key_states]
-            value_state_shards = [value_states]
-            new_length = key_states.shape[2]
+class AgentGridCache(Cache):
+    def __init__(self, tensors: Sequence[torch.Tensor], max_length: int, num_shards: int):
+        super().__init__(layer_classes=AgentGridLayer)
+        key_shards = list(tensors[0::2])
+        value_shards = list(tensors[1::2])
+        self.layers = [AgentGridLayer(key_shards, value_shards)]
+        self.max_length = max_length
+        self.num_shards = num_shards
 
-        self._seq_length = new_length
+    def select_layer_past(self, prefix_length: int) -> Sequence[torch.Tensor]:
+        layer = self.layers[0]
+        key_shards = [k[:, :, :prefix_length, :] for k in layer.key_shards]
+        value_shards = [v[:, :, :prefix_length, :] for v in layer.value_shards]
+        layer_past = tuple(chain(*zip(key_shards, value_shards)))
+        return PerDeviceTensors(*layer_past) if self.num_shards > 1 else layer_past
 
-        num_shards = len(key_state_shards)
-        assert num_shards == len(value_state_shards)
-        assert num_shards * 2 == len(self.tensors)
+    def update(self, key_states: PerDeviceTensors, value_states: PerDeviceTensors, layer_idx: int, cache_kwargs: Optional[Dict[str, Any]] = None) -> Tuple[PerDeviceTensors, PerDeviceTensors]:
+        return self.layers[layer_idx].update(key_states, value_states, cache_kwargs)
 
-        for i in range(num_shards):
-            key_cache_shard = self.tensors[i * 2]
-            value_cache_shard = self.tensors[i * 2 + 1]
-
-            key_state_shard = key_state_shards[i]
-            value_state_shard = value_state_shards[i]
-
-            if HAS_FUSED_UPDATE_KERNEL:
-                update_cache_fused(
-                    key_cache_shard, value_cache_shard, key_state_shard, value_state_shard, prefix_length
-                )
-            else:
-                # Original python-level copy as a fallback
-                if prefix_length < new_length:
-                    update_slice = slice(prefix_length, new_length)
-                    key_cache_shard[:, :, update_slice, :] = key_state_shard[:, :, update_slice, :]
-                    value_cache_shard[:, :, update_slice, :] = value_state_shard[:, :, update_slice, :]
 
 
 class TransformerBackend(ModuleBackend):
@@ -317,10 +274,9 @@ class TransformerBackend(ModuleBackend):
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     layer_past = new_kvs
 
-            if new_kvs is not None and len(new_kvs) == 2:
-                # new_kvs is a tuple of (PerDeviceTensors(keys), PerDeviceTensors(values))
+            if new_kvs is not None:
                 key_states, value_states = new_kvs
-                cache.update_sharded(key_states, value_states, prefix_length=inference_info.prefix_length)
+                cache.update(key_states, value_states, 0, cache_kwargs={"prefix_length": inference_info.prefix_length})
 
             return (output_hidden_states,)
 

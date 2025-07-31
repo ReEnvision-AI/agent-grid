@@ -27,8 +27,8 @@ __version__ = os.getenv("AGENT_GRID_VERSION", "1.1.2")
 
 if not os.getenv("AGENT_GRID_IGNORE_DEPENDENCY_VERSION"):
     assert (
-        version.parse("4.43.1") <= version.parse(transformers.__version__) <= version.parse("4.52.3")
-    ), "Please install a proper transformers version: pip install transformers>=4.43.1,<= 4.52.3"
+        version.parse("4.43.1") <= version.parse(transformers.__version__) <= version.parse("4.54.1")
+    ), "Please install a proper transformers version: pip install transformers>=4.43.1,<= 4.54.1"
 
 
 def _override_bfloat16_mode_default():

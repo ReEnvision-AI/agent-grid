@@ -7,7 +7,7 @@ import torch
 import transformers
 from hivemind.utils.logging import get_logger
 from torch import Tensor
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, CacheLayerMixin
 from transformers.generation.utils import ModelOutput
 
 from agentgrid.client.inference_session import InferenceSession
@@ -17,27 +17,40 @@ from agentgrid.utils.misc import DUMMY, docstring_from
 logger = get_logger(__name__)
 
 
+from transformers.cache_utils import Cache, CacheLayerMixin
+
+
+class RemoteCacheLayer(CacheLayerMixin):
+    def __init__(self):
+        super().__init__()
+        self.seen_tokens = 0
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.seen_tokens += key_states.shape[-2]
+        return key_states, value_states
+
+    def get_seq_length(self, cache_position=None) -> int:
+        return self.seen_tokens
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        pass
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        return self.seen_tokens, 0
+
+
 class RemotePastKeyValues(Cache):
-    """only keeps the number of seen tokens. pretends to be a legit cache"""
+    """A mock cache that merely stores the number of seen tokens. It is used in `RemoteGenerationMixin`."""
 
     def __init__(self) -> None:
-        super().__init__()
-        self._seen_tokens = 0
+        super().__init__(layer_classes=RemoteCacheLayer)
+        self.seen_tokens = 0
 
-    def __getitem__(self, _index: int) -> List[torch.Tensor]:
-        return [DUMMY]
-
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        return self._seen_tokens
-
-    def get_max_length(self) -> Optional[int]:
-        return None
-
-    def update_seen(self, new_seen: int) -> None:
-        self._seen_tokens += new_seen
-
-    def reorder_cache(self, beam_idx):
-        raise NotImplementedError("Beam search reordering is not implemented yet")
+    def update_seen(self, value: int):
+        self.seen_tokens += value
 
 
 _skipped_tokens = ContextVar("skipped_tokens", default=0)
@@ -127,10 +140,8 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 # but keep them for transformers.GenerationMixin (e.g., to compute repetition_penalty)
                 _skipped_tokens.set(max(0, n_prev_tokens - 1))
 
-            if self._supports_cache_class and "past_key_values" not in kwargs:
-                past_key_values = RemotePastKeyValues()
-                past_key_values.update_seen(session.position)
-                kwargs["past_key_values"] = past_key_values
+            if "past_key_values" not in kwargs:
+                kwargs["past_key_values"] = RemotePastKeyValues()
 
             result = super().generate(inputs, *args, **kwargs)
 
