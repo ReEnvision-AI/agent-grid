@@ -146,7 +146,7 @@ class OptimizedLlamaAttention(LlamaAttention):
 
 
 class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, *args, **kwargs):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.self_attn = OptimizedLlamaAttention(config=config, layer_idx=0)

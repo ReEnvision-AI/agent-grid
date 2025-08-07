@@ -112,6 +112,7 @@ class Server:
             converted_model_name_or_path,
             token=token,
             revision=revision,
+            attn_implementation="flash_attention_2"
         )
 
         if dht_prefix is None:

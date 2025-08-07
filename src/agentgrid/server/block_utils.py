@@ -56,16 +56,19 @@ def get_block_size(
 
     return round(n_params * bytes_per_value * (1 + eps))
 
-
+from transformers.utils import is_flash_attn_2_available
 def get_model_block(config, layer_idx: int = 0):
     """
     The function to create a model block based on the block class
     kwargs argument **only** is necessary for specific classes, like Mixtral.
     They will not be passed to other block constructors.
     """
-    if config.block_class == WrappedQwen2Block or config.block_class == WrappedQwen3MoeBlock or config.block_class == WrappedNemotronBlock:
-        return config.block_class(config, layer_idx)
+    if is_flash_attn_2_available():
+        config._attn_implementation = "flash_attention_2"
+
+    #if config.block_class == WrappedQwen2Block or config.block_class == WrappedQwen3MoeBlock or config.block_class == WrappedNemotronBlock:
+    #    return config.block_class(config, layer_idx)
     if config.block_class == WrappedQwen3Block:
         config = PreTrainedModel._autoset_attn_implementation(config)
         return config.block_class(config, layer_idx)
-    return config.block_class(config)
+    return config.block_class(config, layer_idx)
