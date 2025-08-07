@@ -233,6 +233,7 @@ class TransformerBackend(ModuleBackend):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cache_position: torch.Tensor,
         inference_info: InferenceMetadata,
     ) -> Tuple[torch.Tensor, ...]:
         assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]"
@@ -250,6 +251,9 @@ class TransformerBackend(ModuleBackend):
             layer_past = cache.select_layer_past(inference_info.prefix_length)
             new_kvs = None
 
+            if getattr(self.config, "uses_per_layer_attention_mask", False):
+                attention_mask = None
+
             if seq_len <= max_chunk_length:
                 output_hidden_states, new_kvs = self.module.forward(
                     hidden_states,
@@ -257,19 +261,36 @@ class TransformerBackend(ModuleBackend):
                     use_cache=True,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
+                    cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
             else:
                 output_hidden_states = torch.empty_like(hidden_states)
                 for offset in range(0, seq_len, max_chunk_length):
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :]
+                    position_ids_chunk = position_ids[:, offset : offset + max_chunk_length]
+
+                    position_embeddings_chunk = position_embeddings
+                    if (
+                        isinstance(position_embeddings, (list, tuple))
+                        and len(position_embeddings) == 2
+                        and isinstance(position_embeddings[0], torch.Tensor)
+                        and position_embeddings[0].ndim > 1
+                        and position_embeddings[0].shape[1] == seq_len
+                    ):
+                        position_embeddings_chunk = (
+                            position_embeddings[0][:, offset : offset + max_chunk_length],
+                            position_embeddings[1][:, offset : offset + max_chunk_length],
+                        )
+
                     output_hidden_states_chunk, new_kvs = self.module.forward(
                         hidden_states_chunk,
                         layer_past=layer_past,
                         use_cache=True,
                         attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
+                        position_ids=position_ids_chunk,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings_chunk,
                     )
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     layer_past = new_kvs
@@ -339,6 +360,7 @@ class _MergedInferenceStep:
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        cache_position: torch.Tensor,
         inference_infos: Sequence[InferenceMetadata],
         *optional_prompts: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, ...]:
@@ -362,7 +384,7 @@ class _MergedInferenceStep:
                 hidden_states[:, :prompt_len] += prompt_to_add
 
             outputs = self.backends[inference_info.uid].inference_step(
-                hidden_states, attention_mask, position_ids, position_embeddings, inference_info
+                hidden_states, attention_mask, position_ids, position_embeddings, cache_position, inference_info
             )
             hidden_states = outputs[0]
         return (hidden_states,)

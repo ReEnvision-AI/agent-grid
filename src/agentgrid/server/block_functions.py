@@ -158,6 +158,9 @@ async def iterate_rpc_inference(
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
 
+        cache_position = torch.arange(prefix_length, device=hidden_states.device, dtype=torch.long)
+        cache_position = cache_position.expand(hidden_states.shape[0], -1)
+
         # parse deep prompts (optional argument)
         if prompts is None or is_dummy(prompts):
             prompts = [DUMMY] * len(requested_backends)
@@ -190,13 +193,27 @@ async def iterate_rpc_inference(
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
-                    hidden_states, attention_mask, position_ids, position_embeddings, inference_infos, *prompts, priority=priority
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    position_embeddings,
+                    cache_position,
+                    inference_infos,
+                    *prompts,
+                    priority=priority,
                 )
             else:
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
-                        hidden_states, attention_mask, position_ids, position_embeddings, inference_infos, prompt, priority=priority
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        position_embeddings,
+                        cache_position,
+                        inference_infos,
+                        prompt,
+                        priority=priority,
                     )
 
         # serialize and send last layer outputs
