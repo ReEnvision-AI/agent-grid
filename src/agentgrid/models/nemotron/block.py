@@ -393,18 +393,19 @@ class WrappedNemotronBlock(OptimizedNemotronDecoderLayer):
         position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        past_key_value = layer_past
 
         outputs = super().forward(
             hidden_states,
             *args,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_value=layer_past,
             use_cache=use_cache,
+            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )

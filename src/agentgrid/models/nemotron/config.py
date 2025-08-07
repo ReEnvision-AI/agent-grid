@@ -37,6 +37,9 @@ class DistributedNemotronConfig(DeciLMConfig, ClientConfig, PTuneConfig, LMHeadC
     ):
         logger.info("Make sure you follow the Nemotron terms of use: "
                     "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/")
+        
+        if is_flash_attn_2_available():
+            kwargs.setdefault("attn_implementation", "flash_attention_2")
 
         loading_from_repo = model_name_or_path is not None and not os.path.isdir(model_name_or_path)
         if dht_prefix is None:
