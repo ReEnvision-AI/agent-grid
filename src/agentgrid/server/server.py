@@ -14,6 +14,7 @@ import hivemind
 import psutil
 import torch
 import torch.mps
+from accelerate import init_empty_weights
 from hivemind import DHT, MAX_DHT_TIME_DISCREPANCY_SECONDS, BatchTensorDescriptor, get_dht_time
 from hivemind.moe.server.layers import add_custom_models_from_file
 from hivemind.moe.server.runtime import Runtime
@@ -26,7 +27,7 @@ from agentgrid.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 from agentgrid.data_structures import CHAIN_DELIMITER, UID_DELIMITER, ModelInfo, ServerInfo, ServerState, parse_uid
 from agentgrid.server import block_selection
 from agentgrid.server.backend import TransformerBackend, merge_inference_pools_inplace
-from agentgrid.server.block_utils import get_block_size, resolve_block_dtype
+from agentgrid.server.block_utils import get_block_size, get_model_block, resolve_block_dtype
 from agentgrid.server.from_pretrained import load_pretrained_block
 from agentgrid.server.handler import TransformerConnectionHandler
 from agentgrid.server.memory_cache import MemoryCache
@@ -38,7 +39,6 @@ from agentgrid.utils.dht import declare_active_modules, get_remote_module_infos
 from agentgrid.utils.misc import get_size_in_bytes
 from agentgrid.utils.ping import PingAggregator
 from agentgrid.utils.random import sample_up_to
-#from agentgrid.utils.version import get_compatible_model_repo
 
 logger = get_logger(__name__)
 
@@ -92,9 +92,10 @@ class Server:
         use_relay: bool = True,
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
+        memory_calib_factor: float = 1,
         **kwargs,
     ):
-        """Create a server with one or more bloom blocks. See run_server.py for documentation."""
+        """Create a server with one or more blocks. See run_server.py for documentation."""
 
         # converted_model_name_or_path = get_compatible_model_repo(converted_model_name_or_path)
         self.converted_model_name_or_path = converted_model_name_or_path
@@ -104,6 +105,7 @@ class Server:
         self.stats_report_interval, self.update_period = stats_report_interval, update_period
         self.prefetch_batches, self.sender_threads = prefetch_batches, sender_threads
         self.revision, self.token = revision, token
+        self.memory_calib_factor = memory_calib_factor
 
         if custom_module_path is not None:
             add_custom_models_from_file(custom_module_path)
@@ -112,7 +114,6 @@ class Server:
             converted_model_name_or_path,
             token=token,
             revision=revision,
-            attn_implementation="flash_attention_2"
         )
 
         if dht_prefix is None:
@@ -184,7 +185,7 @@ class Server:
             tensor_parallel_devices = (device,)
         self.tensor_parallel_devices = tuple(map(torch.device, tensor_parallel_devices))
         if len(self.tensor_parallel_devices) > 1:
-            logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
+            logger.info(f"Model weights will be split between {', '.join(map(str, tensor_parallel_devices))}")
             check_device_balance(self.tensor_parallel_devices)
 
         if quant_type is None:
@@ -295,83 +296,135 @@ class Server:
         self.module_container = None
         self.stop = threading.Event()
 
-    def _choose_num_blocks(self) -> int:
-        assert self.device.type in ("cuda", "mps"), (
-            "GPU is not available. If you want to run a CPU-only server, please specify --num_blocks. "
-            "CPU-only servers in the public swarm are discouraged since they are much slower"
-        )
-        num_devices = len(self.tensor_parallel_devices) if self.tensor_parallel_devices else 1
+   
 
-        if num_devices > 1:
-            assert self.device.type == "cuda", f"Tensor parallelism is not supported on {self.device.type.upper()}"
-            memory_per_device = tuple(
-                torch.cuda.get_device_properties(device).total_memory for device in self.tensor_parallel_devices
-            )
-            total_memory = min(memory_per_device) * num_devices
-            if max(memory_per_device) / min(memory_per_device) > 1.5:
-                raise ValueError(
-                    "GPU devices have highly uneven memory, which makes tensor parallelism inefficient. "
-                    "Please launch individual servers on each GPU or set --num_blocks manually to "
-                    "override this exception."
-                )
-        elif self.device.type == "cuda":
-            total_memory = torch.cuda.get_device_properties(self.device).total_memory
+    def _get_moe_pool_size_in_bytes(self) -> int:
+        """
+        Calculates the memory required for a pool of MoE experts by inspecting all layers.
+        This is used for models where expert weights are defined inside the block's
+        structure but are shared/tied across all layers in practice.
+        """
+        n_params = 0
+        with init_empty_weights(include_buffers=False):
+            for i in range(self.block_config.num_hidden_layers):
+                block = get_model_block(self.block_config, i)
+                expert_params = (p for name, p in block.named_parameters() if ".experts." in name)
+                layer_params = sum(p.numel() for p in expert_params)
+                if layer_params > 0:
+                    n_params = layer_params  # Assumes all expert layers are the same size
+                    break  # Found the first expert layer, no need to check further
+
+            if n_params == 0:
+                return 0
+
+        if self.quant_type == QuantType.NONE:
+            bytes_per_param = get_size_in_bytes(self.torch_dtype)
+        elif self.quant_type == QuantType.INT8:
+            bytes_per_param = 1
+        elif self.quant_type == QuantType.NF4:
+            bytes_per_param = 4.25 / 8
         else:
-            total_memory = psutil.virtual_memory().total
+            raise ValueError(f"Unsupported quant_type={self.quant_type}")
 
+        total_bytes = int(n_params * bytes_per_param)
         gib = 1024**3
-        autograd_memory = 0  # Removed backward pass, so autograd_memory is 0
+        return total_bytes
 
-        avg_block_size = self._get_avg_block_size_in_bytes()
-        total_memory_per_block = avg_block_size + self._cache_bytes_per_block
-        if self.adapters:
-            # Delay import of agentgrid.utils.peft to avoid unnecessary import of bitsandbytes
-            from agentgrid.utils.peft import estimate_adapter_memory_per_block
+    def _choose_num_blocks(self) -> int:
+        assert self.device.type in ("cuda", "mps"), "GPU not available or specified for auto-detection"
+        gib = 1024**3
 
-            total_memory_per_block += estimate_adapter_memory_per_block(
-                self.block_config,
-                self.torch_dtype,
-                self.adapters,
-                token=self.token,
-                cache_dir=self.cache_dir,
-                max_disk_space=self.max_disk_space,
-            )
+        # Use a smaller safety margin
+        memory_safety_margin = 0.98
+        if self.device.type == "cuda":
+            total_memory = torch.cuda.get_device_properties(self.device).total_memory
+            logger.info(f"Total GPU memory: {total_memory / gib:.2f} GiB")
+            free_memory = torch.cuda.mem_get_info(self.device)[0]
+            logger.info(f"Free GPU memory: {free_memory / gib:.2f} GiB")
+            usable_memory = free_memory * memory_safety_margin
+            logger.info(f"Usable GPU memory (after safety margin): {usable_memory / gib:.2f} GiB")
+        else: # Assumes MPS or other non-CPU devices
+            total_memory = psutil.virtual_memory().total # Note: this is system RAM for MPS/CPU
+            usable_memory = total_memory * memory_safety_margin
 
-        num_blocks = math.floor((total_memory - autograd_memory) / total_memory_per_block)
-        assert num_blocks >= 1, "Your GPU does not have enough memory to serve at least one block"
+
+        # STEP 1: Calculate and reserve all one-time memory costs
+        moe_pool_bytes = self._get_moe_pool_size_in_bytes()
+
+        bytes_per_element = get_size_in_bytes(self.torch_dtype)
+        activation_buffer_bytes = (
+            self.max_batch_size * self.block_config.hidden_size * bytes_per_element
+        )
+        
+        logger.info(f"Reserving {activation_buffer_bytes / gib:.2f} GiB for the inference activation buffer.")
+        
+        available_memory_for_blocks = usable_memory - moe_pool_bytes - activation_buffer_bytes
+        logger.info(f"Available memory for blocks: {available_memory_for_blocks / gib:.2f} GiB")
+        if available_memory_for_blocks < 0:
+            raise ValueError("Not enough GPU memory to fit the expert pool and activation buffer.")
+
+         # STEP 2: Calculate the theoretical memory per block shell + cache
+        avg_block_shell_size = self._get_avg_block_size_in_bytes(force_exclude_experts=True)
+        logger.info(f"Average block shell size: {avg_block_shell_size / 1024**2:.2f} MB")
+        theoretical_mem_per_block = avg_block_shell_size + self._cache_bytes_per_block
+        if theoretical_mem_per_block <= 0:
+             raise ValueError("Calculated memory per block is zero or negative, check model configuration.")
+
+        # --- FINAL FIX: Apply the empirical calibration factor ---
+        # This accounts for all hidden memory overhead from the runtime/framework.
+        total_memory_per_block = theoretical_mem_per_block * self.memory_calib_factor
+        
+        logger.info(f"Theoretical memory per block: {theoretical_mem_per_block / 1024**2:.2f} MB. "
+                    f"Calibrated memory per block (x{self.memory_calib_factor}): {total_memory_per_block / 1024**2:.2f} MB.")
+
+        # STEP 3: Fit blocks into the remaining memory using the calibrated size
+        num_blocks = math.floor(available_memory_for_blocks / total_memory_per_block)
+        assert num_blocks >= 1, "Your GPU does not have enough memory to serve the shared pool and at least one block."
 
         num_blocks = min(num_blocks, self.block_config.num_hidden_layers)
-        logger.info(
-            f"Server will fill your GPU memory with {num_blocks} transformer blocks. "
-            f"If you want to leave some free GPU memory, please specify a lesser --num_blocks manually"
-        )
+        logger.info(f"Server will be able to load {num_blocks} transformer blocks.")
         return num_blocks
 
-    def _get_avg_block_size_in_bytes(self) -> float:
-        if hasattr(self.block_config, "block_configs") and self.block_config.block_configs is not None:
-            block_sizes = []
-            for i, b in enumerate(self.block_config.block_configs):
-                if b.attention.n_heads_in_group is not None:
-                    block_sizes.append(
-                        get_block_size(
-                            self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
-                        )
-                    )
-            return sum(block_sizes) / len(block_sizes) if block_sizes else 0
-        elif hasattr(self.block_config, "num_key_value_heads") and isinstance(
-            self.block_config.num_key_value_heads, list
-        ):
-            block_sizes = [
-                get_block_size(
-                    self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type, block_index=i
+    def _get_avg_block_size_in_bytes(self, force_exclude_experts: bool = False) -> float:
+        num_hidden_layers = getattr(self.block_config, "num_hidden_layers", 0)
+        if not num_hidden_layers:
+            logger.warning("Could not find 'num_hidden_layers' in config, falling back to single block estimate.")
+            return get_block_size("memory", dtype=self.torch_dtype, quant_type=self.quant_type)
+
+        block_sizes = []
+        expert_block_sizes = []
+
+        for i in range(num_hidden_layers):
+            try:
+                # Check if the block has experts before calculating its size
+                with init_empty_weights(include_buffers=False):
+                    block_for_check = get_model_block(self.block_config, i)
+                    has_experts = any(".experts." in name for name, _ in block_for_check.named_parameters())
+
+                block_size = get_block_size(
+                    self.block_config,
+                    "memory",
+                    dtype=self.torch_dtype,
+                    quant_type=self.quant_type,
+                    block_index=i,
+                    exclude_experts=force_exclude_experts
                 )
-                for i in range(self.block_config.num_hidden_layers)
-            ]
-            return sum(block_sizes) / len(block_sizes) if block_sizes else 0
-        else:
-            return get_block_size(
-                self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type
-            )
+                block_sizes.append(block_size)
+                if has_experts:
+                    expert_block_sizes.append(block_size)
+
+            except Exception as e:
+                logger.warning(f"Could not calculate size of block {i}, it will be excluded from the average: {e}")
+
+        if not block_sizes:
+            raise RuntimeError("Could not determine the size of any block. Please check model configuration.")
+
+        # If we are excluding experts, we should only average the expert block shells.
+        if force_exclude_experts and expert_block_sizes:
+            return sum(expert_block_sizes) / len(expert_block_sizes)
+        
+        return sum(block_sizes) / len(block_sizes)
+
 
     def run(self):
         while True:
@@ -477,7 +530,7 @@ class Server:
 
 
 class ModuleContainer(threading.Thread):
-    """Serves a set of specific Bloom layers for inference, forward, and backward. Announces itself over the DHT."""
+    """Serves a set of specific layers for inference, forward, and backward. Announces itself over the DHT."""
 
     # noinspection PyMethodOverriding
     @classmethod

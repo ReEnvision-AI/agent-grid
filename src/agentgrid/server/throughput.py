@@ -231,16 +231,26 @@ def measure_compute_rps(
         position_ids = torch.arange(n_tokens, device=device).unsqueeze(0)
 
         # Skip the 1st step to exclude the initialization time
-        def step(cache_):
-            outputs = block.forward(dummy_input, position_ids=position_ids, use_cache=inference, layer_past=cache_ if inference else None)
+        def step(cache_, cache_position_):
+            outputs = block.forward(
+                dummy_input,
+                position_ids=position_ids,
+                use_cache=inference,
+                layer_past=cache_ if inference else None,
+                cache_position=cache_position_,
+            )
             return outputs[1] if inference else None
 
-        cache = step(cache)
+        past_seen_tokens = cache[0].shape[2] if inference and cache is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens, past_seen_tokens + n_tokens, device=device
+        )
+        cache = step(cache, cache_position)
         synchronize(device)
 
         start_time = time.perf_counter()
         for _ in range(n_steps):
-            cache = step(cache)
+            cache = step(cache, cache_position)
         synchronize(device)
         elapsed = time.perf_counter() - start_time
         device_rps = n_steps * n_tokens / elapsed

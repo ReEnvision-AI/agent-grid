@@ -44,7 +44,7 @@ def load_pretrained_block(
     max_disk_space: Optional[int] = None,
 ) -> nn.Module:
     if config is None:
-        config = AutoDistributedConfig.from_pretrained(model_name, token=token, attn_implementation="flash_attention_2")
+        config = AutoDistributedConfig.from_pretrained(model_name, token=token)
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
 
