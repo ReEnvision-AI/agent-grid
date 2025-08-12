@@ -1,12 +1,6 @@
 # List of available models
 MODELS=(
-    "meta-llama/Llama-3.3-70B-Instruct"
     "meta-llama/Llama-3.1-8B-Instruct"
     "Qwen/Qwen2.5-Coder-32B-Instruct"
-    "Qwen/Qwen3-235B-A22B"
-    "Qwen/Qwen3-30B-A3B"
-    "Qwen/Qwen3-8B"
-    "Qwen/Qwen3-32B"
-    "nvidia/Llama-3.3-Nemotron-70B-Feedback"
-    "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5"
 )

@@ -1,21 +1,255 @@
 [build-system]
-requires = [
-    "setuptools>=42",
-    "wheel"
-]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+# Optional: uv-specific configuration
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-forked",
+    "pytest-asyncio>=0.26.0",
+    "pytest-xdist",
+    "pytest-timeout",
+    "pytest-cov",
+    "psutil",
+    "ruff>=0.11.0",
+    "black>=24.0.0",
+    "isort>=5.13.0",
+    "mypy>=1.11.0",
+    "pre-commit>=3.5.0",
+    "rich>=14.1.0",
+]
+
+[project]
+name = "agent-grid"
+dynamic = ["version"]
+authors = [
+    {name = "ReEnvision AI"},
+]
+maintainers = [
+    {name = "ReEnvision AI"},
+]
+description = "Easy way to efficiently run 100B+ language models without high-end GPUs"
+readme = "README.md"
+license = {text = "Apache-2.0"}  # Update this to your actual license
+requires-python = ">=3.11"
+keywords = [
+    "language-models",
+    "distributed-computing",
+    "llm",
+    "gpu",
+    "artificial-intelligence",
+    "machine-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",  # Update based on your license
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",  # Add if you have type hints
+]
+dependencies = [
+    "torch==2.6.0",
+    "bitsandbytes==0.46.0",
+    "accelerate==1.7.0",
+    "huggingface-hub==0.34.3",
+    "tokenizers==0.21.2",
+    "transformers==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
+    "speedtest-cli==2.1.3",
+    "hivemind @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.4",  # uv prefers .git extension
+    "tensor_parallel==2.0.0",
+    "humanfriendly==10.0",
+    "async-timeout==5.0.1",
+    "cpufeature==0.2.1; platform_machine == 'x86_64'",
+    "packaging==25.0",
+    "sentencepiece==0.2.0",
+    "peft==0.8.2",
+    "safetensors==0.5.3",
+    "Dijkstar==2.6.0",
+    "numpy==2.3.1",
+    "triton==3.2.0",
+    "environs==14.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-forked",
+    "pytest-asyncio>=0.26.0",
+    "pytest-xdist",
+    "pytest-timeout",
+    "pytest-cov",
+    "psutil",
+    "ruff>=0.11.0",
+    "black>=24.0.0",
+    "isort>=5.13.0",
+    "mypy>=1.11.0",
+    "pre-commit>=3.5.0",
+]
+test = [
+    "pytest>=8.0.0",
+    "pytest-forked",
+    "pytest-asyncio>=0.26.0",
+    "pytest-xdist",
+    "pytest-timeout",
+    "pytest-cov",
+    "psutil",
+]
+lint = [
+    "ruff>=0.11.0",
+    "black>=24.0.0",
+    "isort>=5.13.0",
+    "mypy>=1.11.0",
+]
+docs = [
+    "sphinx>=7.0.0",
+    "sphinx-rtd-theme>=2.0.0",
+    "sphinx-autodoc-typehints>=1.25.0",
+]
+all = [
+    "agent-grid[dev,test,lint,docs]",
+]
+
+[project.urls]
+Homepage = "https://github.com/reenvision-ai/agent-grid"
+Repository = "https://github.com/reenvision-ai/agent-grid"
+Documentation = "https://github.com/reenvision-ai/agent-grid#readme"
+"Bug Tracker" = "https://github.com/reenvision-ai/agent-grid/issues"
+Changelog = "https://github.com/reenvision-ai/agent-grid/releases"
+
+[project.scripts]
+# Add any CLI commands here if your package provides them
+agent-grid = "agentgrid.cli.run_server:main"
+agent-grid-bootstrap = "agentgrid.cli.run_dht:main"
+agent-grid-client = "agentgrid.cli.run_client:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentgrid*"]
+namespaces = false
+
+[tool.setuptools.dynamic]
+version = {file = ["src/agentgrid/VERSION"]}
+
+[tool.setuptools.package-data]
+agentgrid = ["VERSION", "py.typed"]  # Include VERSION file and py.typed if you have type hints
+
+# Development tools configuration
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "B905",  # zip() without an explicit strict= parameter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports in __init__ files
+"tests/*" = ["S101"]  # allow assert in tests
 
 [tool.black]
 line-length = 120
-required-version = "22.3.0"
+target-version = ["py311", "py312"]
+include = '\.pyi?$'
 
 [tool.isort]
 profile = "black"
 line_length = 120
-combine_as_imports = true
-combine_star = true
-known_local_folder = ["tests", "cli"]
-known_first_party = ["test_utils"]
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
 
-[tool.ruff.lint]
-select = ["NPY201"]
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_any_generics = false
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=agentgrid",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "network: marks tests as requiring network access",
+    "gpu: marks tests as requiring GPU",
+]
+
+[tool.coverage.run]
+source = ["src/agentgrid"]
+branch = true
+parallel = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+precision = 2
+show_missing = true
