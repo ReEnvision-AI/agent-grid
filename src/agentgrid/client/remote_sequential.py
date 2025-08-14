@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Generator, Optional, Tuple, Union
 
 import torch
 from hivemind import DHT, get_logger
@@ -10,8 +10,10 @@ from torch import nn
 
 from agentgrid.client.config import ClientConfig
 from agentgrid.client.inference_session import InferenceSession
+from agentgrid.client.performance_monitor import timed_operation
 from agentgrid.client.routing import RemoteSequenceManager
 from agentgrid.client.sequential_autograd import _RemoteSequentialAutogradFunction
+from agentgrid.client.session_pool import CachedSequenceManager, get_session_pool
 from agentgrid.data_structures import UID_DELIMITER
 
 logger = get_logger(__name__)
@@ -26,10 +28,10 @@ class RemoteSequential(nn.Module):
         self,
         config: ClientConfig,
         *,
-        sequence_manager: Optional[RemoteSequenceManager] = None,
-        dht: Optional[DHT] = None,
-        start_block: Optional[int] = None,
-        end_block: Optional[int] = None,
+        sequence_manager: RemoteSequenceManager | None = None,
+        dht: DHT | None = None,
+        start_block: int | None = None,
+        end_block: int | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -45,11 +47,14 @@ class RemoteSequential(nn.Module):
                 end_block = self.config.num_hidden_layers
             block_uids = tuple(f"{config.dht_prefix}{UID_DELIMITER}{i}" for i in range(start_block, end_block))
             sequence_manager = RemoteSequenceManager(config, block_uids, dht=dht, **kwargs)
-        self.sequence_manager = sequence_manager
+
+        # Wrap with caching layer to reduce overhead
+        self.sequence_manager = CachedSequenceManager(sequence_manager)
+        self._session_pool = get_session_pool()
 
         self._active_session = ContextVar("active_session", default=None)
 
-    def forward(self, inputs: torch.Tensor, prompts: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None, position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, **kwargs) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, prompts: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs) -> torch.Tensor:
         assert inputs.ndim == 3, "inputs must be a tensor of shape [batch_size, seq_length, hidden_size]"
         if self.active_session is None:
             return _RemoteSequentialAutogradFunction.apply(inputs, prompts, attention_mask, position_ids, position_embeddings, self.sequence_manager, kwargs)
@@ -57,7 +62,7 @@ class RemoteSequential(nn.Module):
             return self.active_session.step(inputs, prompts, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings, **kwargs)
 
     @property
-    def active_session(self) -> Optional[InferenceSession]:
+    def active_session(self) -> InferenceSession | None:
         """
         If called inside `with model.inference_session(...):` or `with model.use_session(...):`,
         returns an active InferenceSession. Otherwise, returns None.
@@ -72,7 +77,7 @@ class RemoteSequential(nn.Module):
         return self.active_session.position if self.active_session is not None else 0
 
     @contextmanager
-    def use_session(self, session: Optional[InferenceSession]) -> Generator[InferenceSession, None, None]:
+    def use_session(self, session: InferenceSession | None) -> Generator[InferenceSession, None, None]:
         """Inside this context, forward() will use an _existing_ InferenceSession provided as the argument."""
 
         token = self._active_session.set(session)
@@ -89,11 +94,46 @@ class RemoteSequential(nn.Module):
         :param max_length: Maximal expected length of inference results. Servers use this parameter
                            to calculate the size of attention caches allocated to this client.
         """
+        max_length = kwargs.get('max_length', 2048)
 
-        with InferenceSession(self.sequence_manager, **kwargs) as session, self.use_session(session):
-            yield session
+        with timed_operation("inference_session_creation"):
+            # Always try to get spans from cache first to avoid redundant computation
+            spans = None
+            try:
+                with timed_operation("span_computation"):
+                    spans = self.sequence_manager.make_sequence_cached(
+                        mode="min_latency",
+                        cache_tokens_needed=max_length
+                    )
+            except Exception as e:
+                logger.debug(f"Failed to pre-compute spans for session pool: {e}")
+                # If cached version fails, get spans directly but suppress duplicate logging
+                original_show_route = self.sequence_manager.sequence_manager.config.show_route
+                self.sequence_manager.sequence_manager.config.show_route = False
+                try:
+                    spans = self.sequence_manager.sequence_manager.make_sequence(
+                        mode="min_latency",
+                        cache_tokens_needed=max_length
+                    )
+                finally:
+                    self.sequence_manager.sequence_manager.config.show_route = original_show_route
 
-    def __getitem__(self, ix: Union[int, slice]) -> RemoteSequential:
+            with timed_operation("session_pool_get"):
+                session = self._session_pool.get_session(
+                    self.sequence_manager.sequence_manager,  # Unwrap cached manager
+                    max_length,
+                    spans=spans  # Now spans should never be None
+                )
+
+        try:
+            with session, self.use_session(session):
+                yield session
+        finally:
+            # Return session to pool for reuse
+            with timed_operation("session_pool_return"):
+                self._session_pool.return_session(session)
+
+    def __getitem__(self, ix: int | slice) -> RemoteSequential:
         return RemoteSequential(
             self.config,
             sequence_manager=self.sequence_manager[ix],

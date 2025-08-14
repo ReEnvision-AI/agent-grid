@@ -47,7 +47,11 @@ class MemoryCache:
         # Compaction parameters
         self.COMPACTION_THRESHOLD = 10  # Compact if a bucket has more than this many tensors
         self._compaction_counter = 0
-        self._compaction_calls_threshold = 100  # Run compaction check every this many use_cache calls
+        self._compaction_calls_threshold = 100  # Base interval for compaction checks
+        self._adaptive_compaction_min_interval = 50  # Minimum calls between compaction checks
+        self._adaptive_compaction_max_interval = 500  # Maximum calls between compaction checks
+        self._memory_pressure_threshold = 0.8  # Compact more aggressively when cache is 80% full
+        self._last_compaction_found_work = False  # Track if last compaction actually did work
 
         # Predictive allocation
         self._session_patterns: Dict[str, List[List[TensorDescriptor]]] = {}
@@ -273,12 +277,89 @@ class MemoryCache:
             self._memory_freed_event.set()
         logger.info(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
 
+    def _needs_compaction(self) -> bool:
+        """Check if any pools have enough tensors to warrant compaction."""
+        for device_pools in self._free_pools.values():
+            for dtype_pools in device_pools.values():
+                for pool in dtype_pools.values():
+                    if len(pool) >= self.COMPACTION_THRESHOLD:
+                        return True
+        return False
+
+    def _calculate_fragmentation_score(self) -> float:
+        """Calculate a fragmentation score based on pool distribution."""
+        total_tensors = 0
+        total_pools = 0
+        
+        for device_pools in self._free_pools.values():
+            for dtype_pools in device_pools.values():
+                for pool in dtype_pools.values():
+                    if pool:  # Only count non-empty pools
+                        total_tensors += len(pool)
+                        total_pools += 1
+        
+        if total_pools == 0:
+            return 0.0
+        
+        # Higher score means more fragmentation (many small pools)
+        return total_pools / max(1, total_tensors)
+
+    def _get_memory_pressure(self) -> float:
+        """Get current memory pressure as a ratio of used/max memory."""
+        with self._pooled_size_bytes.get_lock():
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value
+        return total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
+
+    def _calculate_adaptive_interval(self) -> int:
+        """Calculate adaptive compaction interval based on memory pressure and fragmentation."""
+        memory_pressure = self._get_memory_pressure()
+        fragmentation_score = self._calculate_fragmentation_score()
+        
+        # Base interval adjustment factors
+        pressure_factor = 1.0
+        fragmentation_factor = 1.0
+        recency_factor = 1.0
+        
+        # Adjust based on memory pressure - compact more often when under pressure
+        if memory_pressure > self._memory_pressure_threshold:
+            pressure_factor = 0.5  # Halve the interval (compact twice as often)
+        elif memory_pressure > 0.6:
+            pressure_factor = 0.75  # Compact 33% more often
+        
+        # Adjust based on fragmentation - more fragmented pools need more frequent compaction
+        if fragmentation_score > 0.8:
+            fragmentation_factor = 0.6  # Compact more often with high fragmentation
+        elif fragmentation_score > 0.5:
+            fragmentation_factor = 0.8
+        
+        # Adjust based on whether last compaction found work
+        if not self._last_compaction_found_work:
+            recency_factor = 1.5  # Increase interval if last compaction didn't find work
+        
+        # Calculate final interval
+        adaptive_interval = int(
+            self._compaction_calls_threshold * pressure_factor * fragmentation_factor * recency_factor
+        )
+        
+        # Clamp to min/max bounds
+        return max(
+            self._adaptive_compaction_min_interval,
+            min(self._adaptive_compaction_max_interval, adaptive_interval)
+        )
+
     def _compact_memory_pools(self):
         """
-        A simple compaction strategy that runs periodically.
+        An adaptive compaction strategy that runs when pools actually need compaction.
         It finds buckets with many tensors and attempts to merge them into larger tensors.
         """
+        if not self._needs_compaction():
+            logger.debug("Skipping compaction - no pools need compaction")
+            self._last_compaction_found_work = False
+            return
+        
         logger.info("Running memory pool compaction...")
+        compaction_work_done = False
+        
         for device, device_pools in self._free_pools.items():
             for dtype, dtype_pools in device_pools.items():
                 # Find the bucket with the most tensors (candidate for compaction)
@@ -288,6 +369,8 @@ class MemoryCache:
                         logger.info(
                             f"Compacting pool on {device}:{dtype} with {len(pool)} tensors of size {numel}"
                         )
+                        initial_pool_size = len(pool)
+                        
                         while len(pool) >= 2:
                             t1 = pool.pop()
                             t2 = pool.pop()
@@ -308,7 +391,15 @@ class MemoryCache:
                             new_pool = dtype_pools.setdefault(new_numel, [])
                             new_pool.append(new_tensor)
                             dtype_pools.move_to_end(new_numel)
-                        logger.info(f"Compaction finished for pool. New size: {len(pool)}")
+                            compaction_work_done = True
+                        
+                        logger.info(f"Compaction finished for pool. Size: {initial_pool_size} -> {len(pool)}")
+        
+        self._last_compaction_found_work = compaction_work_done
+        if compaction_work_done:
+            logger.info("Memory pool compaction completed with work done")
+        else:
+            logger.debug("Memory pool compaction completed with no work needed")
 
     def _predict_and_preallocate(self, session_id: str):
         """Compares active session with past patterns and pre-allocates the next tensor if a match is found."""
@@ -341,9 +432,11 @@ class MemoryCache:
     def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
         assert os.getpid() == self.runtime_pid
 
-        # Step 1: Periodic compaction
+        # Step 1: Adaptive periodic compaction
         self._compaction_counter += 1
-        if self._compaction_counter >= self._compaction_calls_threshold:
+        adaptive_interval = self._calculate_adaptive_interval()
+        
+        if self._compaction_counter >= adaptive_interval:
             self._compact_memory_pools()
             self._compaction_counter = 0
 
