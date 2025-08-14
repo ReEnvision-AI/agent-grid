@@ -135,6 +135,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         context: P2PContext,
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         """Compute a single step of inference using attention cache; update attention cache accordingly."""
+        session_id = None
         async with timeout(self.session_timeout):
             try:
                 request = await asyncio.wait_for(anext(requests), self.step_timeout)
@@ -168,7 +169,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                 batch_size = request.tensors[0].size[0] if request.tensors else 1
 
                 async with self._allocate_cache(
-                    requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
+                    requested_backends,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    timeout=alloc_timeout,
+                    session_id=session_id,
                 ) as cache_handles:
                     background_task = None
                     async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
@@ -193,6 +198,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                         yield runtime_pb2.ExpertResponse(tensors=output_tensors)
 
             finally:
+                if session_id:
+                    self.module_backends[requested_uids[0]].memory_cache.end_session(session_id)
                 self._log_request("rpc_inference.close", requested_uids, context)
 
     @contextlib.contextmanager
@@ -460,13 +467,16 @@ class TransformerConnectionHandler(ConnectionHandler):
         batch_size: int,
         max_length: int,
         timeout: Optional[float],
+        session_id: Optional[str] = None,
     ) -> Sequence[Sequence[Handle]]:
         """
         Allocate memory cache for all transformer blocks, return cache handle
         :returns: a list of {len(backends)} elements, where i-th element is a tuple of cache handles for i-th backend
         """
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
-        async with backends[0].memory_cache.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+        async with backends[0].memory_cache.allocate_cache(
+            *chain(*descriptors), timeout=timeout, session_id=session_id
+        ) as handles:
             yield nested_pack(handles, descriptors)
 
     def _log_request(

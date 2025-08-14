@@ -10,6 +10,7 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
+from collections import OrderedDict
 from typing import AsyncContextManager, Counter, Dict, List, Optional, Sequence
 
 import async_timeout
@@ -31,15 +32,27 @@ class MemoryCache:
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
         self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
+        self._pooled_size_bytes = mp.Value(ctypes.c_int64, 0, lock=True)
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
-        self._free_pools: Dict[TensorDescriptor, List[torch.Tensor]] = {}
+        # New free pools structure: {device: {dtype: OrderedDict(numel: [tensors])}}
+        self._free_pools: Dict[torch.device, Dict[torch.dtype, "OrderedDict[int, List[torch.Tensor]]"]] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
+
+        # Compaction parameters
+        self.COMPACTION_THRESHOLD = 10  # Compact if a bucket has more than this many tensors
+        self._compaction_counter = 0
+        self._compaction_calls_threshold = 100  # Run compaction check every this many use_cache calls
+
+        # Predictive allocation
+        self._session_patterns: Dict[str, List[List[TensorDescriptor]]] = {}
+        self._active_sessions: Dict[str, List[TensorDescriptor]] = {}
+        self._pre_allocated_tensors: Dict[str, List[torch.Tensor]] = {}
 
     @property
     def current_size_bytes(self) -> int:
@@ -59,7 +72,8 @@ class MemoryCache:
 
     @property
     def bytes_left(self) -> int:
-        return self.max_size_bytes - self.current_size_bytes
+        with self._pooled_size_bytes.get_lock():
+            return self.max_size_bytes - (self.current_size_bytes + self._pooled_size_bytes.value)
 
     @property
     def handle_counter(self) -> int:
@@ -69,15 +83,25 @@ class MemoryCache:
     def handle_counter(self, value: int):
         self._handle_counter.value = value
 
+    def end_session(self, session_id: str):
+        """
+        Signals the end of an allocation session, moving the session's allocation
+        history to the stored patterns for future prediction.
+        """
+        assert os.getpid() != self.runtime_pid, "This method must be called from a ConnectionHandler"
+        with self._lock_metadata:
+            self._pipe_send.send((None, None, {"command": "end_session", "session_id": session_id}))
+
     @contextlib.asynccontextmanager
     async def allocate_cache(
-        self, *descriptors: TensorDescriptor, timeout: float
+        self, *descriptors: TensorDescriptor, timeout: float, session_id: Optional[str] = None
     ) -> AsyncContextManager[Sequence[Handle]]:
         """
         Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
 
         :param descriptors: one or more tensors tensor of this size, dtype, etc
         :param timeout: optional maximum time to wait for cache allocation; None (default) means no time limit
+        :param session_id: optional identifier for tracking allocation patterns for prediction
 
         :note: if descriptors reside on different devices, it is expected that they are approximately balanced across devices;
           if not, it will count maximum tensor allocation across devices for the purposes of size limit
@@ -92,14 +116,16 @@ class MemoryCache:
         max_alloc_size = self.get_allocation_size(*descriptors)
 
         gib = 1024**3
-        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
+        with self._pooled_size_bytes.get_lock():
+            pooled_size = self._pooled_size_bytes.value
+        cur_size, max_size = self.current_size_bytes + pooled_size, self.max_size_bytes
         friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
         logger.info(
             f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
             f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({cur_size / max_size * 100:.1f}%)"
         )
 
-        alloc_task = asyncio.create_task(self._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout))
+        alloc_task = asyncio.create_task(self._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout, session_id=session_id))
         try:
             handles = await shield_and_wait(alloc_task)
             logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
@@ -120,7 +146,7 @@ class MemoryCache:
         return max(alloc_size_by_device.values())
 
     async def _schedule_alloc(
-        self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
+        self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float], session_id: Optional[str] = None
     ) -> Sequence[Handle]:
         """
         This method should be called inside asyncio.shield() because:
@@ -132,7 +158,8 @@ class MemoryCache:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
                     self.current_size_bytes += alloc_size
                     self.handle_counter += len(handles)  # note: this will eventually overflow and it is okay
-                    self._pipe_send.send((handles, descriptors))
+                    command_info = {"session_id": session_id} if session_id else None
+                    self._pipe_send.send((handles, descriptors, command_info))
                     return handles
         except TimeoutError:
             raise AllocationFailed(f"Could not allocate {alloc_size} (timeout={timeout})")
@@ -149,10 +176,15 @@ class MemoryCache:
             context_manager = async_timeout.timeout(timeout) if timeout != 0 else contextlib.AsyncExitStack()
             # contextlib.AsyncExitStack() is used as a null context here
             async with context_manager:
-                if timeout == 0 and self.current_size_bytes + self.enqueued_size_bytes > self.max_size_bytes:
+                with self._pooled_size_bytes.get_lock():
+                    total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+                if timeout == 0 and total_size > self.max_size_bytes:
                     raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
+
                 async with enter_asynchronously(self._lock_acquire_memory):
-                    if self.current_size_bytes + alloc_size > self.max_size_bytes:
+                    with self._pooled_size_bytes.get_lock():
+                        current_total_size = self.current_size_bytes + self._pooled_size_bytes.value
+                    if current_total_size + alloc_size > self.max_size_bytes:
                         if timeout == 0:
                             raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
                         elapsed_time = time.perf_counter() - start_time
@@ -176,7 +208,7 @@ class MemoryCache:
         handles = alloc_task.result()
 
         with self._lock_metadata:
-            self._pipe_send.send((handles, None))  # signal runtime to free these handles
+            self._pipe_send.send((handles, None, None))  # signal runtime to free these handles
             self.current_size_bytes -= alloc_size
         self._memory_freed_event.set()
 
@@ -188,39 +220,207 @@ class MemoryCache:
             )
         timeout = timeout if timeout != float("inf") else None
         deadline = None if timeout is None else time.perf_counter() + timeout
-        while self.current_size_bytes + allocated_size > self.max_size_bytes:
+        while True:
+            with self._pooled_size_bytes.get_lock():
+                current_total_size = self.current_size_bytes + self._pooled_size_bytes.value
+            if current_total_size + allocated_size <= self.max_size_bytes:
+                break
+
             remaining_time = None if timeout is None else deadline - time.perf_counter()
+            if remaining_time is not None and remaining_time <= 0:
+                raise AllocationFailed(
+                    f"Server's attention cache is full, failed to allocate {allocated_size} bytes in {timeout} seconds"
+                )
+
             if not self._memory_freed_event.wait(remaining_time):
                 raise AllocationFailed(
                     f"Server's attention cache is full, failed to allocate {allocated_size} bytes in {timeout} seconds"
                 )
             self._memory_freed_event.clear()
 
+    def _evict_memory(self, bytes_to_free: int):
+        """Evicts tensors from free pools in LRU order until at least `bytes_to_free` are freed."""
+        bytes_freed = 0
+        devices = list(self._free_pools.keys())
+        for device in devices:
+            if bytes_freed >= bytes_to_free:
+                break
+            dtypes = list(self._free_pools.get(device, {}).keys())
+            for dtype in dtypes:
+                if bytes_freed >= bytes_to_free:
+                    break
+                numels = list(self._free_pools[device].get(dtype, {}).keys())
+                for numel in numels:
+                    if bytes_freed >= bytes_to_free:
+                        break
+                    pool = self._free_pools[device][dtype][numel]
+                    while pool and bytes_freed < bytes_to_free:
+                        tensor = pool.pop()
+                        tensor_size = tensor.numel() * get_size_in_bytes(tensor.dtype)
+                        with self._pooled_size_bytes.get_lock():
+                            self._pooled_size_bytes.value -= tensor_size
+                        bytes_freed += tensor_size
+                        del tensor  # Let python GC reclaim memory
+                    if not pool:
+                        del self._free_pools[device][dtype][numel]
+
+                if not self._free_pools[device][dtype]:
+                    del self._free_pools[device][dtype]
+            if not self._free_pools[device]:
+                del self._free_pools[device]
+
+        if bytes_freed > 0:
+            self._memory_freed_event.set()
+        logger.info(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
+
+    def _compact_memory_pools(self):
+        """
+        A simple compaction strategy that runs periodically.
+        It finds buckets with many tensors and attempts to merge them into larger tensors.
+        """
+        logger.info("Running memory pool compaction...")
+        for device, device_pools in self._free_pools.items():
+            for dtype, dtype_pools in device_pools.items():
+                # Find the bucket with the most tensors (candidate for compaction)
+                # We iterate over a copy of keys since we might modify the dictionary
+                for numel, pool in list(dtype_pools.items()):
+                    if len(pool) >= self.COMPACTION_THRESHOLD:
+                        logger.info(
+                            f"Compacting pool on {device}:{dtype} with {len(pool)} tensors of size {numel}"
+                        )
+                        while len(pool) >= 2:
+                            t1 = pool.pop()
+                            t2 = pool.pop()
+                            new_numel = t1.numel() + t2.numel()
+
+                            try:
+                                # The accounting for _pooled_size_bytes does not change here,
+                                # as we are replacing two tensors with one of their combined size.
+                                new_tensor = torch.empty(new_numel, dtype=dtype, device=device)
+                            except Exception as e:
+                                logger.warning(f"Compaction failed to allocate new tensor: {e}")
+                                # If allocation fails, put the tensors back and stop.
+                                pool.append(t1)
+                                pool.append(t2)
+                                break
+
+                            # Add the new, larger tensor to its corresponding pool
+                            new_pool = dtype_pools.setdefault(new_numel, [])
+                            new_pool.append(new_tensor)
+                            dtype_pools.move_to_end(new_numel)
+                        logger.info(f"Compaction finished for pool. New size: {len(pool)}")
+
+    def _predict_and_preallocate(self, session_id: str):
+        """Compares active session with past patterns and pre-allocates the next tensor if a match is found."""
+        if session_id not in self._active_sessions or session_id in self._pre_allocated_tensors:
+            return  # No history to predict from or already pre-allocated
+
+        history = self._active_sessions[session_id]
+        if not history:
+            return
+
+        for pattern in self._session_patterns.get(session_id, []):
+            if len(pattern) > len(history) and pattern[: len(history)] == history:
+                # Found a matching pattern, predict the next step
+                next_descriptor = pattern[len(history)]
+                logger.info(f"Predictive allocation for session {session_id}: found pattern, next is {next_descriptor}")
+
+                # Attempt to find and reserve a tensor from free pools
+                numel = next_descriptor.numel()
+                device_pools = self._free_pools.get(next_descriptor.device)
+                if device_pools:
+                    dtype_pools = device_pools.get(next_descriptor.dtype)
+                    if dtype_pools and numel in dtype_pools and dtype_pools[numel]:
+                        pre_allocated_tensor = dtype_pools[numel].pop()
+                        self._pre_allocated_tensors.setdefault(session_id, []).append(pre_allocated_tensor)
+                        logger.info(f"Pre-allocated tensor for session {session_id}")
+                        # We found a prediction and pre-allocated, we are done for this step
+                        return
+
     @contextlib.contextmanager
     def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
-        """
-        Return one or more tensors previously allocated with allocate_cache,
-
-        :note: This method is called by ModuleBackend in runtime: a single process with NO process parallelism.
-        However, runtime may call use_cache concurrently with one or more connection handlers calling allocate_cache
-        """
         assert os.getpid() == self.runtime_pid
-        # note: this specific function is not concurrent, so you can safely allocate/offload/defragment data here
 
-        # read creation/deletion requests from connection handlers
+        # Step 1: Periodic compaction
+        self._compaction_counter += 1
+        if self._compaction_counter >= self._compaction_calls_threshold:
+            self._compact_memory_pools()
+            self._compaction_counter = 0
+
+        # Step 2: Evict memory if cache is over budget
+        with self._pooled_size_bytes.get_lock():
+            total_size = self.current_size_bytes + self._pooled_size_bytes.value
+        if total_size > self.max_size_bytes:
+            self._evict_memory(total_size - self.max_size_bytes)
+
+        # Step 3: read creation/deletion requests from connection handlers
         while self._pipe_recv.poll():
-            recv_handles, recv_data = self._pipe_recv.recv()
+            message = self._pipe_recv.recv()
+            recv_handles, recv_data, command_info = message if len(message) == 3 else (message[0], message[1], None)
+
+            if command_info and command_info.get("command") == "end_session":
+                session_id = command_info["session_id"]
+                if session_id in self._active_sessions:
+                    history = self._active_sessions.pop(session_id)
+                    patterns = self._session_patterns.setdefault(session_id, [])
+                    patterns.append(history)
+                    logger.info(f"Ended session {session_id}, stored allocation pattern with {len(history)} steps.")
+                if session_id in self._pre_allocated_tensors: # Clean up any leftover pre-allocations
+                    for tensor in self._pre_allocated_tensors.pop(session_id):
+                        # Return tensor to the free pool
+                        descr = TensorDescriptor.from_tensor(tensor)
+                        device_pool = self._free_pools.setdefault(descr.device, {})
+                        dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
+                        numel_pool = dtype_pool.setdefault(tensor.numel(), [])
+                        numel_pool.append(tensor)
+                continue
+
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
+                session_id = command_info.get("session_id") if command_info else None
+                if session_id:
+                    session_history = self._active_sessions.setdefault(session_id, [])
+                    session_history.extend(recv_data)
+
                 for handle, descr in zip(recv_handles, recv_data):
-                    if not self._free_pools.get(descr):
+                    reused_tensor = None
+                    numel = descr.numel()
+
+                    # Step 3a: Try to fulfill from pre-allocated tensors first
+                    if session_id and session_id in self._pre_allocated_tensors:
+                        pre_allocated_pool = self._pre_allocated_tensors[session_id]
+                        for i, tensor in enumerate(pre_allocated_pool):
+                            if tensor.numel() == numel and tensor.dtype == descr.dtype and tensor.device == descr.device:
+                                reused_tensor = pre_allocated_pool.pop(i)
+                                logger.info(f"Used pre-allocated tensor for session {session_id}")
+                                break
+                        if not pre_allocated_pool:
+                            del self._pre_allocated_tensors[session_id]
+
+                    # Step 3b: If not found, try to fulfill from general free pools
+                    if reused_tensor is None:
+                        device_pools = self._free_pools.get(descr.device)
+                        if device_pools:
+                            dtype_pools = device_pools.get(descr.dtype)
+                            if dtype_pools and numel in dtype_pools and dtype_pools[numel]:
+                                reused_tensor = dtype_pools[numel].pop()
+                                dtype_pools.move_to_end(numel)
+
+                    if reused_tensor is not None:
+                        self._allocated_tensors[handle] = reused_tensor.view(descr.shape)
+                        tensor_size = reused_tensor.numel() * get_size_in_bytes(reused_tensor.dtype)
+                        with self._pooled_size_bytes.get_lock():
+                            self._pooled_size_bytes.value -= tensor_size
+                    else:
                         self._allocated_tensors[handle] = torch.empty(
                             descr.shape, dtype=descr.dtype, device=descr.device
                         )
-                    else:
-                        self._allocated_tensors[handle] = self._free_pools[descr].pop()
                     assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
-            else:  # delete tensors by handle
+                
+                if session_id: # After fulfilling request, try to predict and pre-allocate the next one
+                    self._predict_and_preallocate(session_id)
+
+            elif recv_handles is not None:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
                         logger.warning(
@@ -229,9 +429,19 @@ class MemoryCache:
                         continue
                     tensor = self._allocated_tensors.pop(handle)
                     descr = TensorDescriptor.from_tensor(tensor)
-                    if descr not in self._free_pools:
-                        self._free_pools[descr] = []
-                    self._free_pools[descr].append(tensor)
+                    numel = tensor.numel()
+
+                    device_pool = self._free_pools.setdefault(descr.device, {})
+                    dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
+                    numel_pool = dtype_pool.setdefault(numel, [])
+                    numel_pool.append(tensor)
+                    dtype_pool.move_to_end(numel)  # Mark as recently used
+
+                    tensor_size = numel * get_size_in_bytes(descr.dtype)
+                    with self._pooled_size_bytes.get_lock():
+                        self._pooled_size_bytes.value += tensor_size
+
+        # Step 4: Yield tensors
         yield tuple(self._allocated_tensors[handle] for handle in handles)
 
 
