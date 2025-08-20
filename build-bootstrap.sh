@@ -23,8 +23,8 @@ if [ -z "$CR_USER" ]; then
     exit 1
 fi
 
-# Define the version for the Docker Image, default to 1.0.0
-VERSION=${AGENT_GRID_VERSION:-"1.0.0"}
+# Get the version from the Python package
+VERSION=$(python3 -c "import sys; sys.path.insert(0, 'src'); import agentgrid; print(agentgrid.__version__)")
 echo "Building Agent Grid container version $VERSION"
 
 

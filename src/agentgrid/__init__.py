@@ -22,7 +22,9 @@ from agentgrid.utils.logging import initialize_logs as _initialize_logs
 env = Env()
 env.read_env(override=True)
 
-__version__ = os.getenv("AGENT_GRID_VERSION", "1.1.2")
+# Read version from VERSION file
+with open(os.path.join(os.path.dirname(__file__), "VERSION"), "r") as f:
+    __version__ = f.read().strip()
 
 
 if not os.getenv("AGENT_GRID_IGNORE_DEPENDENCY_VERSION"):
