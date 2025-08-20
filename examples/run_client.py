@@ -37,7 +37,7 @@ def generate(model_id: str) -> None:
         model_name_or_path=model_id,
         torch_dtype=torch.bfloat16,
         initial_peers=["/ip4/127.0.0.1/tcp/31331/p2p/Qmbnu3pqyWvXaehb5si5mpyeVQh7RZMPcrrWBX2gnWcc3D"],
-        #attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2",
     ).to("cuda")
 
     # Load the tokenizer

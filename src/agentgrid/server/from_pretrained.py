@@ -48,6 +48,14 @@ def load_pretrained_block(
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
 
+    # Set attention implementation if not already set
+    if not hasattr(config, '_attn_implementation') or config._attn_implementation is None:
+        import importlib.util
+        if importlib.util.find_spec("flash_attn") is not None:
+            config._attn_implementation = "flash_attention_2"
+        else:
+            config._attn_implementation = "eager"
+
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
     torch_dtype = resolve_block_dtype(config, torch_dtype)
 
