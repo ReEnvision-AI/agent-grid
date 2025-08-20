@@ -1,0 +1,51 @@
+# Lightweight CPU-only bootstrap server for Agent Grid DHT
+FROM python:3.11-slim
+
+LABEL maintainer="ReEnvision-AI"
+LABEL repository="agent-grid-bootstrap"
+LABEL org.opencontainers.image.source="https://github.com/ReEnvision-AI/agent-grid"
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+ENV IDENTITY_FILENAME=identity_0.key
+
+# Create non-root user for podman compatibility
+RUN groupadd -r agentgrid && useradd -r -g agentgrid -d /app -s /bin/bash agentgrid
+
+# Install system dependencies (minimal)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create application directory and set ownership
+WORKDIR /app
+RUN chown agentgrid:agentgrid /app
+
+# Copy source code and pyproject.toml
+COPY --chown=agentgrid:agentgrid src/ /app/src/
+COPY --chown=agentgrid:agentgrid pyproject.toml /app/
+COPY --chown=agentgrid:agentgrid identity_files/ /app/identity_files/
+
+# Install CPU-only torch first for faster build
+RUN pip install torch==2.6.0 --no-cache-dir --index-url https://download.pytorch.org/whl/cpu
+
+# Install bootstrap package with minimal dependencies
+RUN pip install --no-cache-dir -e .[bootstrap]
+
+# Switch to non-root user for podman compatibility
+USER agentgrid
+
+# Expose DHT port
+EXPOSE 8788
+
+# Health check (disable for OCI compatibility or use --format docker if needed)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+     CMD python -c "import agentgrid.cli.run_dht; print('OK')" || exit 1
+
+# Default command
+CMD agent-grid-bootstrap --host_maddrs /ip4/0.0.0.0/tcp/8788 /ip6/::/tcp/8788 --identity_path /app/identity_files/${IDENTITY_FILENAME}

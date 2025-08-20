@@ -60,29 +60,38 @@ classifiers = [
     "Typing :: Typed",  # Add if you have type hints
 ]
 dependencies = [
+    # Core minimal dependencies
+    "Dijkstar==2.6.0",
+    "requests==2.31.0", 
+    "packaging==25.0",
+    "async-timeout==5.0.1",
+    "humanfriendly==10.0",
+    "environs==14.1.1",
+    "tensor_parallel==2.0.0",
+]
+
+[project.optional-dependencies]
+bootstrap = [
+    "transformers[torch]==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
+    "hivemind[cpu] @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
+]
+full = [
+    # GPU and full inference dependencies
     "torch==2.6.0",
+    "hivemind @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
     "bitsandbytes==0.46.0",
     "accelerate==1.7.0",
     "huggingface-hub==0.34.3",
     "tokenizers==0.21.2",
-    "transformers==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
     "speedtest-cli==2.1.3",
-    "hivemind @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.4",  # uv prefers .git extension
-    "tensor_parallel==2.0.0",
-    "humanfriendly==10.0",
-    "async-timeout==5.0.1",
     "cpufeature==0.2.1; platform_machine == 'x86_64'",
-    "packaging==25.0",
     "sentencepiece==0.2.0",
     "peft==0.8.2",
     "safetensors==0.5.3",
-    "Dijkstar==2.6.0",
     "numpy==2.3.1",
     "triton==3.2.0",
-    "environs==14.1.1",
+    "transformers==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
 ]
-
-[project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "pytest-forked",

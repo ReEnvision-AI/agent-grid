@@ -15,14 +15,14 @@ ENV AGENT_GRID_CACHE=/cache
 
 # Create project directory and copy only dependency-related files first to leverage Docker cache
 RUN mkdir -p /home/agent-grid/src/agentgrid/
-COPY setup.cfg /home/agent-grid/
+#COPY setup.cfg /home/agent-grid/
 COPY pyproject.toml /home/agent-grid/
 COPY src/agentgrid/VERSION /home/agent-grid/src/agentgrid/VERSION
 COPY src/agentgrid/__init__.py /home/agent-grid/src/agentgrid/__init__.py
 
 # Install core project dependencies
 WORKDIR /home/agent-grid/
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e .[full]
 
 # Copy the rest of the application code
 COPY . /home/agent-grid/
