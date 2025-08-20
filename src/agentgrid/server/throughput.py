@@ -209,6 +209,11 @@ def measure_compute_rps(
     if not tensor_parallel_devices:
         tensor_parallel_devices = (device,)
     with torch.inference_mode():
+        # Set attention implementation to "eager" for throughput calculation
+        if hasattr(config, '_attn_implementation'):
+            original_attn_impl = config._attn_implementation
+            config._attn_implementation = "eager"
+        
         if hasattr(config, 'block_configs') and config.block_configs is not None:
             # For Nemotron models, get num_kv_heads from block_configs
             num_kv_heads = config.block_configs[0].attention.n_heads_in_group
@@ -252,6 +257,11 @@ def measure_compute_rps(
         f"{'Inference' if inference else 'Forward pass'} throughput: {device_rps:.1f} tokens/sec per block "
         f"({n_tokens} tokens/batch, {devices_repr}, {get_dtype_name(dtype, quant_type)})"
     )
+    
+    # Restore original attention implementation
+    if hasattr(config, '_attn_implementation') and 'original_attn_impl' in locals():
+        config._attn_implementation = original_attn_impl
+        
     return device_rps
 
 
