@@ -90,7 +90,7 @@ full = [
     "safetensors==0.5.3",
     "numpy==2.3.1",
     "triton==3.2.0",
-    "transformers==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
+    "transformers==4.55.4",  # if you change this, please also change version assert in agentgrid/__init__.py
 ]
 dev = [
     "pytest>=8.0.0",
