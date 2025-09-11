@@ -258,7 +258,7 @@ class OptimizedNemotronDecoderLayer(DeciLMDecoderLayer):
         if not self.attention_config.no_op:
             self.input_layernorm = DeciLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if not self.attention_config.replace_with_linear:
-                self.self_attn = DECILM_ATTENTION_CLASSES[config._attn_implementation](
+                self.self_attn = DECILM_ATTENTION_CLASSES[config._attn_implementation or 'eager'](
                     config=config, attention_config=self.attention_config, layer_idx=layer_idx)
             else:
                 self.self_attn = WrappedDeciLMLinearAttention(config)
