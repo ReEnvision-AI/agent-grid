@@ -4,25 +4,24 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from hivemind import get_logger
 
-from agentgrid.utils.cuda_graphs import make_inference_graphed_callable
-
+from agentgrid.models.nemotron.block_config import AttentionConfig
 from agentgrid.models.nemotron.configuration_decilm import DeciLMConfig
 from agentgrid.models.nemotron.modeling_decilm import (
     DeciLMAttention,
-    DeciLMFlashAttention2,
     DeciLMDecoderLayer,
-    DeciLMRMSNorm,
-    DeciLMLinearAttention,
-    DeciLMMLP,
+    DeciLMFlashAttention2,
     DeciLMLinearMLP,
+    DeciLMMLP,
+    DeciLMRMSNorm,
     apply_rotary_pos_emb,
-    repeat_kv
+    repeat_kv,
 )
-from agentgrid.models.nemotron.transformers_4_44_2__modeling_flash_attention_utils_backward_compat import _flash_attention_forward
-from agentgrid.models.nemotron.block_config import AttentionConfig
-
-from hivemind import get_logger
+from agentgrid.models.nemotron.transformers_4_44_2__modeling_flash_attention_utils_backward_compat import (
+    _flash_attention_forward,
+)
+from agentgrid.utils.cuda_graphs import make_inference_graphed_callable
 
 try:
     from agentgrid.models.nemotron.kernels import apply_rotary_pos_emb_fused
@@ -35,8 +34,6 @@ logger = get_logger(__name__)
 class BaseNemotronAttention:
     ...
 
-class WrappedDeciLMLinearAttention(DeciLMLinearAttention, BaseNemotronAttention):
-    ...
 
 class OptimizedNemotronAttention(DeciLMAttention, BaseNemotronAttention):
     def __init__(self, config: DeciLMConfig, attention_config: AttentionConfig, layer_idx: Optional[int] = None):
@@ -97,6 +94,8 @@ class OptimizedNemotronAttention(DeciLMAttention, BaseNemotronAttention):
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -261,7 +260,7 @@ class OptimizedNemotronDecoderLayer(DeciLMDecoderLayer):
                 self.self_attn = DECILM_ATTENTION_CLASSES[config._attn_implementation or 'eager'](
                     config=config, attention_config=self.attention_config, layer_idx=layer_idx)
             else:
-                self.self_attn = WrappedDeciLMLinearAttention(config)
+                self.self_attn = OptimizedNemotronAttention(config)
 
         if not self.ffn_config.no_op:
             self.post_attention_layernorm = DeciLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
