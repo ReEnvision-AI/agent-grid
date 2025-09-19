@@ -169,9 +169,12 @@ class TransformerBackend(ModuleBackend):
             head_dims_on_shard = []
             for submodule in shard.modules():
                 if isinstance(submodule, config.attn_class):
-                    num_heads_on_shard += submodule.num_attention_heads
-                    if hasattr(submodule, "num_key_value_heads"):
-                        num_kv_heads_on_shard += submodule.num_key_value_heads
+                    attn_heads = getattr(submodule, "num_attention_heads", config.num_attention_heads)
+                    num_heads_on_shard += attn_heads
+                    kv_heads = getattr(submodule, "num_key_value_heads", None)
+                    if kv_heads is None:
+                        kv_heads = getattr(config, "num_key_value_heads", attn_heads)
+                    num_kv_heads_on_shard += kv_heads
                     if hasattr(submodule, "head_dim"):
                         head_dims_on_shard.append(submodule.head_dim)
 

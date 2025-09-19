@@ -214,13 +214,12 @@ def measure_compute_rps(
             original_attn_impl = config._attn_implementation
             config._attn_implementation = "eager"
         
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         if hasattr(config, 'block_configs') and config.block_configs is not None:
             # For Nemotron models, get num_kv_heads from block_configs
             num_kv_heads = config.block_configs[0].attention.n_heads_in_group
-            head_dim = config.hidden_size // config.num_attention_heads
         else:
             # For Llama and other models
-            head_dim = config.hidden_size // config.num_attention_heads
             num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
 
         dummy_key = torch.randn(
