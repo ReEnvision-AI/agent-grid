@@ -82,14 +82,16 @@ class DistributedQwen2Model(FromPretrainedMixin, PTuneMixin, Qwen2Model):
             position_ids = cache_position.unsqueeze(0)
 
         mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
+            "config": self.config,
+            "input_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": None,
+            "position_ids": position_ids,
+        }
         causal_mask = create_causal_mask(**mask_kwargs)
+        if causal_mask is not None and causal_mask.device != inputs_embeds.device:
+            causal_mask = causal_mask.to(inputs_embeds.device)
 
         hidden_states = inputs_embeds
         # create position embeddings to be shared across the decoder layers
