@@ -53,6 +53,7 @@ class RemoteSequential(nn.Module):
         self._session_pool = get_session_pool()
 
         self._active_session = ContextVar("active_session", default=None)
+        self._span_cache: dict[int, tuple] = {}
 
     def forward(self, inputs: torch.Tensor, prompts: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs) -> torch.Tensor:
         assert inputs.ndim == 3, "inputs must be a tensor of shape [batch_size, seq_length, hidden_size]"
@@ -98,25 +99,28 @@ class RemoteSequential(nn.Module):
 
         with timed_operation("inference_session_creation"):
             # Always try to get spans from cache first to avoid redundant computation
-            spans = None
-            try:
-                with timed_operation("span_computation"):
-                    spans = self.sequence_manager.make_sequence_cached(
-                        mode="min_latency",
-                        cache_tokens_needed=max_length
-                    )
-            except Exception as e:
-                logger.debug(f"Failed to pre-compute spans for session pool: {e}")
-                # If cached version fails, get spans directly but suppress duplicate logging
-                original_show_route = self.sequence_manager.sequence_manager.config.show_route
-                self.sequence_manager.sequence_manager.config.show_route = False
+            spans = self._span_cache.get(max_length)
+            if spans is None:
                 try:
-                    spans = self.sequence_manager.sequence_manager.make_sequence(
-                        mode="min_latency",
-                        cache_tokens_needed=max_length
-                    )
-                finally:
-                    self.sequence_manager.sequence_manager.config.show_route = original_show_route
+                    with timed_operation("span_computation"):
+                        spans = self.sequence_manager.make_sequence_cached(
+                            mode="min_latency",
+                            cache_tokens_needed=max_length
+                        )
+                except Exception as e:
+                    logger.debug(f"Failed to pre-compute spans for session pool: {e}")
+                    # If cached version fails, get spans directly but suppress duplicate logging
+                    original_show_route = self.sequence_manager.sequence_manager.config.show_route
+                    self.sequence_manager.sequence_manager.config.show_route = False
+                    try:
+                        spans = self.sequence_manager.sequence_manager.make_sequence(
+                            mode="min_latency",
+                            cache_tokens_needed=max_length
+                        )
+                    finally:
+                        self.sequence_manager.sequence_manager.config.show_route = original_show_route
+                if spans is not None:
+                    self._span_cache[max_length] = spans
 
             with timed_operation("session_pool_get"):
                 session = self._session_pool.get_session(

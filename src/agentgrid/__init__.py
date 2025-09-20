@@ -18,6 +18,26 @@ from agentgrid.models import *
 from agentgrid.utils import *
 from agentgrid.utils.logging import initialize_logs as _initialize_logs
 
+try:  # enable faster matmul kernels when available
+    import torch
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            sdp = torch.backends.cuda.sdp_kernel
+            sdp.enable_flash_sdp(True)
+            sdp.enable_math_sdp(True)
+            sdp.enable_mem_efficient_sdp(True)
+        except Exception:  # pragma: no cover
+            pass
+except Exception:  # pragma: no cover - best effort tuning
+    pass
+
 
 env = Env()
 env.read_env(override=True)

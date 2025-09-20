@@ -114,11 +114,13 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             #assert (max_length is None) != (
             #    max_new_tokens is None
             #), "You should set `max_length` or `max_new_tokens` (but not both) to reserve server-side attention caches"
-            session_max_length = self.transformer.config.pre_seq_len
+            prompt_tokens = inputs.shape[1] if inputs is not None else 0
+            session_max_length = prompt_tokens
             if max_new_tokens is not None:
-                session_max_length += (inputs.shape[1] if inputs is not None else 0) + max_new_tokens
+                session_max_length += max_new_tokens
             else:
                 session_max_length += max_length or 20
+            session_max_length = max(session_max_length, prompt_tokens + 1)
             context_manager = self.inference_session(max_length=session_max_length)
 
         with context_manager as session:
@@ -162,4 +164,3 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         # Suppress inappropriate "Both max_new_tokens and max_length" HF warning
         if "max_length" in kwargs and kwargs["max_length"] is None:
             del kwargs["max_length"]
-

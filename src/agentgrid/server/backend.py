@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from itertools import chain
 from typing import Any, Dict, Optional, Sequence, Tuple, TypeAlias, Union
 
+import os
 import torch
 from hivemind import BatchTensorDescriptor, TensorDescriptor
 from hivemind.moe.server.module_backend import ModuleBackend
@@ -12,6 +13,8 @@ from tensor_parallel import TensorParallel
 from tensor_parallel.per_device_tensors import PerDeviceTensors
 from transformers import PretrainedConfig
 from transformers.cache_utils import Cache, CacheLayerMixin
+
+import time
 
 from agentgrid.data_structures import InferenceMetadata
 from agentgrid.server.memory_cache import MemoryCache
@@ -163,6 +166,12 @@ class TransformerBackend(ModuleBackend):
         self.shard_num_heads = []
         self.shard_num_kv_heads = []
         self.shard_head_dims = []
+
+        profile_env = os.getenv("AGENTGRID_PROFILE_INFERENCE", "0").lower()
+        self.enable_profiling = profile_env not in {"0", "false", "no", ""}
+        self._profile_samples: deque[Tuple[float, int]] = deque(maxlen=int(os.getenv("AGENTGRID_PROFILE_WINDOW", "100")))
+        self._profile_last_log = time.perf_counter()
+        self._profile_log_interval = float(os.getenv("AGENTGRID_PROFILE_LOG_INTERVAL", "30"))
         for shard in self.module.module_shards:
             num_heads_on_shard = 0
             num_kv_heads_on_shard = 0
@@ -190,6 +199,7 @@ class TransformerBackend(ModuleBackend):
         assert len(self.shard_head_dims) == len(self.module.devices)
 
         self.overall_head_dim = next((dim for dim in self.shard_head_dims if dim > 0), 0)
+        self._warmup_inference()
 
         self.inference_schema = (
             (
@@ -242,6 +252,9 @@ class TransformerBackend(ModuleBackend):
 
         assert isinstance(position_embeddings, tuple), "expected position_embeddings to be a tuple"
         seq_len = hidden_states.shape[1]
+        batch_size = hidden_states.shape[0]
+
+        profile_start = time.perf_counter() if self.enable_profiling else 0.0
 
         with self.memory_cache.use_cache(
             *inference_info.cache_handles
@@ -281,6 +294,27 @@ class TransformerBackend(ModuleBackend):
                 key_states, value_states = new_kvs
                 cache.update(key_states, value_states, 0, cache_kwargs={"prefix_length": inference_info.prefix_length})
 
+            if self.enable_profiling:
+                duration = time.perf_counter() - profile_start
+                processed_tokens = batch_size * seq_len
+                self._profile_samples.append((duration, processed_tokens))
+                now = time.perf_counter()
+                if now - self._profile_last_log >= self._profile_log_interval and self._profile_samples:
+                    total_time = sum(sample[0] for sample in self._profile_samples)
+                    total_tokens = sum(sample[1] for sample in self._profile_samples)
+                    avg_latency = total_time / len(self._profile_samples)
+                    avg_batch_tokens = total_tokens / len(self._profile_samples)
+                    throughput = total_tokens / total_time if total_time else float("inf")
+                    logger.info(
+                        "[profiling] backend=%s samples=%d avg_latency=%.3fs avg_tokens=%.1f tokens_per_sec=%.1f",
+                        self.name,
+                        len(self._profile_samples),
+                        avg_latency,
+                        avg_batch_tokens,
+                        throughput,
+                    )
+                    self._profile_last_log = now
+
             return (output_hidden_states,)
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
@@ -291,6 +325,43 @@ class TransformerBackend(ModuleBackend):
         if attn_bytes_per_token == 0:
             return 1
         return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
+
+    def _warmup_inference(self) -> None:
+        warmup_tokens = int(os.getenv("AGENTGRID_WARMUP_TOKENS", "16"))
+        if warmup_tokens <= 0:
+            return
+        try:
+            device = self.module.devices[self.module.output_device_index]
+            dtype = self.dtype
+            hidden_size = self.config.hidden_size
+            seq_len = min(warmup_tokens, getattr(self.config, "max_position_embeddings", warmup_tokens))
+            hidden_states = torch.zeros((1, seq_len, hidden_size), dtype=dtype, device=device)
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+            for block in self.module.module_shards:
+                kwargs = {
+                    "attention_mask": None,
+                    "position_ids": position_ids,
+                    "layer_past": None,
+                    "use_cache": False,
+                }
+                if hasattr(block, "rotary_emb"):
+                    position_embeddings = block.rotary_emb(hidden_states, position_ids)
+                    kwargs["position_embeddings"] = position_embeddings
+                try:
+                    outputs = block(hidden_states, **kwargs)
+                except TypeError:
+                    outputs = block(hidden_states)
+                if isinstance(outputs, tuple):
+                    hidden_states = outputs[0]
+                else:
+                    hidden_states = outputs
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            logger.info("Warmup inference completed for %s with %d tokens", self.name, seq_len)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("Warmup inference skipped for %s: %s", self.name, exc)
 
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
         """If hypo_ids is specified, reorder elements of each cache tensor in-place by taking indices from hypo_ids"""
