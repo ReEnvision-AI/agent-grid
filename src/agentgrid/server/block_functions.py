@@ -3,7 +3,6 @@ This module implements server-side computations on served blocks: forward, backw
 """
 from __future__ import annotations
 
-import os
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -40,9 +39,9 @@ def _prepare_prompts(prompts: torch.Tensor, requested_backends: Sequence[Transfo
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
-MAX_SHORT_INFERENCE_TOKENS = int(os.getenv("AGENTGRID_SHORT_INFERENCE_TOKENS", "256"))
+MAX_SHORT_INFERENCE_TOKENS = 128
 # Updated based on bitsandbytes 0.45.0+ performance improvements for NF4
-MAX_NF4_SHORT_INFERENCE_TOKENS = int(os.getenv("AGENTGRID_NF4_SHORT_INFERENCE_TOKENS", "256"))
+MAX_NF4_SHORT_INFERENCE_TOKENS = 128
 
 logger = get_logger(__name__)
 

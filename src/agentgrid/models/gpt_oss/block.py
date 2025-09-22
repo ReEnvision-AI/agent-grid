@@ -1,30 +1,13 @@
 from typing import Optional, Tuple
 
 import torch
-from hivemind import get_logger
 from tensor_parallel.per_device_tensors import PerDeviceTensors
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
-from transformers.models.gpt_oss.modeling_gpt_oss import GptOssDecoderLayer, GptOssRotaryEmbedding
+from hivemind import get_logger
 
 logger = get_logger(__name__)
-
-
-def _preferred_attention_impl() -> str:
-    if not torch.cuda.is_available():
-        return "eager"
-    try:
-        from torch.backends.cuda import sdp_kernel  # type: ignore[attr-defined]
-
-        if getattr(sdp_kernel, "is_flash_sdp_enabled", lambda: False)():
-            return "flash_attention_2"
-        if getattr(sdp_kernel, "is_math_sdp_enabled", lambda: False)() or getattr(
-            sdp_kernel, "is_mem_efficient_sdp_enabled", lambda: False
-        )():
-            return "sdpa"
-    except Exception:  # pragma: no cover
-        pass
-    return "eager"
+from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+from transformers.models.gpt_oss.modeling_gpt_oss import GptOssDecoderLayer, GptOssRotaryEmbedding
 
 
 class _NormalizedDynamicCache(DynamicCache):
@@ -84,7 +67,7 @@ class _NormalizedDynamicCache(DynamicCache):
 class WrappedGptOssBlock(GptOssDecoderLayer):
     def __init__(self, config: GptOssConfig, layer_idx: int):
         if getattr(config, "_attn_implementation", None) is None:
-            config._attn_implementation = _preferred_attention_impl()
+            config._attn_implementation = "eager"
         self._config = config
         super().__init__(config, layer_idx)
         self.layer_idx = layer_idx

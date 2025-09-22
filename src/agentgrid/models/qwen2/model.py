@@ -1,4 +1,3 @@
-import os
 from typing import Union
 from hivemind import DHT, get_logger
 
@@ -18,7 +17,6 @@ from agentgrid.client.ptune import PTuneMixin
 from agentgrid.client.remote_generation import RemoteGenerationMixin, RemotePastKeyValues
 from agentgrid.client.remote_sequential import RemoteSequential
 from agentgrid.models.qwen2.config import DistributedQwen2Config
-from agentgrid.models._mask_cache import LRUMaskCache
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
@@ -44,8 +42,6 @@ class DistributedQwen2Model(FromPretrainedMixin, PTuneMixin, Qwen2Model):
 
         self.requires_grad_(False)
         self.init_prompts(config)
-        cache_size = int(os.getenv("AGENTGRID_MASK_CACHE_SIZE", "32"))
-        self._mask_cache = LRUMaskCache(max_size=cache_size)
 
     def forward(
         self,
@@ -93,26 +89,9 @@ class DistributedQwen2Model(FromPretrainedMixin, PTuneMixin, Qwen2Model):
             "past_key_values": None,
             "position_ids": position_ids,
         }
-
-        can_cache_mask = (
-            attention_mask is None
-            and (past_key_values is None or past_key_values.get_seq_length() == 0)
-            and cache_position.numel() > 0
-            and cache_position.min().item() == 0
-        )
-
-        causal_mask = None
-        if can_cache_mask:
-            cache_key = (inputs_embeds.shape[1], inputs_embeds.device.type, inputs_embeds.device.index)
-            cached = self._mask_cache.get(cache_key)
-            if cached is not None:
-                causal_mask = cached
-        if causal_mask is None:
-            causal_mask = create_causal_mask(**mask_kwargs)
-            if causal_mask is not None and causal_mask.device != inputs_embeds.device:
-                causal_mask = causal_mask.to(inputs_embeds.device)
-            if can_cache_mask and causal_mask is not None:
-                self._mask_cache.put(cache_key, causal_mask)
+        causal_mask = create_causal_mask(**mask_kwargs)
+        if causal_mask is not None and causal_mask.device != inputs_embeds.device:
+            causal_mask = causal_mask.to(inputs_embeds.device)
 
         hidden_states = inputs_embeds
         # create position embeddings to be shared across the decoder layers

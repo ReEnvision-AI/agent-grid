@@ -1,4 +1,3 @@
-import os
 from typing import Optional
 
 import torch
@@ -17,7 +16,6 @@ from agentgrid.client.lm_head import LMHead
 from agentgrid.client.ptune import PTuneMixin
 from agentgrid.client.remote_generation import RemoteGenerationMixin, RemotePastKeyValues
 from agentgrid.client.remote_sequential import RemoteSequential
-from agentgrid.models._mask_cache import LRUMaskCache
 from agentgrid.models.gpt_oss.config import DistributedGptOssConfig
 
 
@@ -38,8 +36,6 @@ class DistributedGptOssModel(FromPretrainedMixin, PTuneMixin, GptOssModel):
         self.layers = RemoteSequential(config, dht=dht)
         self.requires_grad_(False)
         self.init_prompts(config)
-        cache_size = int(os.getenv("AGENTGRID_MASK_CACHE_SIZE", "32"))
-        self._mask_cache = LRUMaskCache(max_size=cache_size)
 
     def forward(
         self,
@@ -90,36 +86,13 @@ class DistributedGptOssModel(FromPretrainedMixin, PTuneMixin, GptOssModel):
             "input_embeds": inputs_embeds,
             "attention_mask": attention_mask,
             "cache_position": cache_position,
-            "past_key_values": None,
+            "past_key_values": past_key_values,
         }
-
-        can_cache_mask = (
-            attention_mask is None
-            and (past_key_values is None or past_key_values.get_seq_length() == 0)
-            and cache_position.numel() > 0
-            and cache_position.min().item() == 0
-        )
-
-        full_mask = None
-        if can_cache_mask:
-            cache_key = (inputs_embeds.shape[1], inputs_embeds.device.type, inputs_embeds.device.index)
-            cached = self._mask_cache.get(cache_key)
-            if cached is not None:
-                full_mask = cached
-        if full_mask is None:
-            full_mask = create_causal_mask(**mask_kwargs)
-            if full_mask is not None and full_mask.device != inputs_embeds.device:
-                full_mask = full_mask.to(inputs_embeds.device)
-            if can_cache_mask and full_mask is not None:
-                self._mask_cache.put(cache_key, full_mask)
-
-        sliding_mask = create_sliding_window_causal_mask(**mask_kwargs)
-        if sliding_mask is not None and sliding_mask.device != inputs_embeds.device:
-            sliding_mask = sliding_mask.to(inputs_embeds.device)
-
+        full_mask_kwargs = mask_kwargs.copy()
+        full_mask_kwargs["past_key_values"] = None
         causal_mask_mapping = {
-            "full_attention": full_mask,
-            "sliding_attention": sliding_mask,
+            "full_attention": create_causal_mask(**full_mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**full_mask_kwargs),
         }
 
         hidden_states = inputs_embeds
@@ -127,7 +100,6 @@ class DistributedGptOssModel(FromPretrainedMixin, PTuneMixin, GptOssModel):
 
         all_hidden_states = (hidden_states,) if output_hidden_states else None
 
-        target_length = cache_position[-1].item() + 1
         hidden_states = self.layers(
             hidden_states,
             prompts=None,

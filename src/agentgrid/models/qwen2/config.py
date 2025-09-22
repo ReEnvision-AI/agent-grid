@@ -1,7 +1,5 @@
 import os
 
-import torch
-
 from hivemind import get_logger
 
 from agentgrid.client.config import ClientConfig
@@ -40,14 +38,4 @@ class DistributedQwen2Config(Qwen2Config, ClientConfig, PTuneConfig, LMHeadConfi
         result = super().from_pretrained(model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs)
         config = result[0] if isinstance(result, tuple) else result
         config.use_cache = True  # use_cache=False leads to identical results but is slower and not supported by Agent Grid
-        if getattr(config, "_attn_implementation", None) is None and torch.cuda.is_available():
-            try:
-                from torch.backends.cuda import sdp_kernel  # type: ignore[attr-defined]
-
-                if getattr(sdp_kernel, "is_flash_sdp_enabled", lambda: False)():
-                    config._attn_implementation = "flash_attention_2"
-                else:
-                    config._attn_implementation = "sdpa"
-            except Exception:  # pragma: no cover
-                config._attn_implementation = "sdpa"
         return result
