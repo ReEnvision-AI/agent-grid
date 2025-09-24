@@ -43,6 +43,27 @@ from agentgrid.utils.random import sample_up_to
 logger = get_logger(__name__)
 
 
+class BlockLoadingOutOfMemoryError(RuntimeError):
+    """Raised when the server runs out of GPU memory while loading transformer blocks."""
+
+    def __init__(self, *, attempted_blocks: int, loaded_blocks: int, original_exception: BaseException):
+        message = (
+            f"Out of memory while loading {attempted_blocks} transformer blocks "
+            f"(successfully loaded {loaded_blocks})."
+        )
+        super().__init__(message)
+        self.attempted_blocks = attempted_blocks
+        self.loaded_blocks = loaded_blocks
+        self.original_exception = original_exception
+
+
+def _is_out_of_memory_error(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc)
+    return "out of memory" in message.lower()
+
+
 class Server:
     """
     Runs ModuleContainer, periodically checks that the network is balanced,
@@ -188,6 +209,12 @@ class Server:
 
         if quant_type is None:
             quant_type = QuantType.NF4 if device.type == "cuda" else QuantType.NONE
+
+        if quant_type == QuantType.NF4 and getattr(self.block_config, "model_type", None) == "gpt_oss":
+            logger.warning(
+                "NF4 quantization is not supported for GPT-OSS blocks; falling back to bfloat16 weights"
+            )
+            quant_type = QuantType.NONE
         self.quant_type = quant_type
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
@@ -283,6 +310,8 @@ class Server:
             using_relay=reachable_via_relay,
             **throughput_info,
         )
+        self._throughput_info = throughput_info
+        self._reachable_via_relay = reachable_via_relay
         self.model_info = ModelInfo(num_blocks=self.block_config.num_hidden_layers)
         if not os.path.isdir(converted_model_name_or_path):
             self.model_info.repository = "https://huggingface.co/" + converted_model_name_or_path
@@ -372,44 +401,90 @@ class Server:
                 self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type
             )
 
+    def _update_throughput_info(self) -> None:
+        throughput_info = get_server_throughput(
+            self.converted_model_name_or_path,
+            self.block_config,
+            self.device,
+            self.torch_dtype,
+            num_blocks=self.num_blocks,
+            quant_type=self.quant_type,
+            tensor_parallel_devices=self.tensor_parallel_devices,
+            reachable_via_relay=self._reachable_via_relay,
+            cache_dir=self.cache_dir,
+        )
+        self._throughput_info = throughput_info
+        self.server_info.throughput = throughput_info["throughput"]
+        self.server_info.inference_rps = throughput_info.get("inference_rps")
+        self.server_info.forward_rps = throughput_info.get("forward_rps")
+        self.server_info.network_rps = throughput_info.get("network_rps")
+
     def run(self):
         while True:
             block_indices = self._choose_blocks()
-            self.module_container = ModuleContainer.create(
-                dht=self.dht,
-                dht_prefix=self.dht_prefix,
-                converted_model_name_or_path=self.converted_model_name_or_path,
-                block_config=self.block_config,
-                attn_cache_bytes=self.attn_cache_bytes,
-                server_info=self.server_info,
-                model_info=self.model_info,
-                block_indices=block_indices,
-                num_handlers=self.num_handlers,
-                min_batch_size=self.min_batch_size,
-                max_batch_size=self.max_batch_size,
-                max_chunk_size_bytes=self.max_chunk_size_bytes,
-                max_alloc_timeout=self.max_alloc_timeout,
-                inference_max_length=self.inference_max_length,
-                torch_dtype=self.torch_dtype,
-                cache_dir=self.cache_dir,
-                max_disk_space=self.max_disk_space,
-                device=self.device,
-                compression=self.compression,
-                stats_report_interval=self.stats_report_interval,
-                update_period=self.update_period,
-                expiration=self.expiration,
-                request_timeout=self.request_timeout,
-                session_timeout=self.session_timeout,
-                step_timeout=self.step_timeout,
-                prefetch_batches=self.prefetch_batches,
-                sender_threads=self.sender_threads,
-                revision=self.revision,
-                token=self.token,
-                quant_type=self.quant_type,
-                tensor_parallel_devices=self.tensor_parallel_devices,
-                should_validate_reachability=self.should_validate_reachability,
-                start=True,
-            )
+            try:
+                self.module_container = ModuleContainer.create(
+                    dht=self.dht,
+                    dht_prefix=self.dht_prefix,
+                    converted_model_name_or_path=self.converted_model_name_or_path,
+                    block_config=self.block_config,
+                    attn_cache_bytes=self.attn_cache_bytes,
+                    server_info=self.server_info,
+                    model_info=self.model_info,
+                    block_indices=block_indices,
+                    num_handlers=self.num_handlers,
+                    min_batch_size=self.min_batch_size,
+                    max_batch_size=self.max_batch_size,
+                    max_chunk_size_bytes=self.max_chunk_size_bytes,
+                    max_alloc_timeout=self.max_alloc_timeout,
+                    inference_max_length=self.inference_max_length,
+                    torch_dtype=self.torch_dtype,
+                    cache_dir=self.cache_dir,
+                    max_disk_space=self.max_disk_space,
+                    device=self.device,
+                    compression=self.compression,
+                    stats_report_interval=self.stats_report_interval,
+                    update_period=self.update_period,
+                    expiration=self.expiration,
+                    request_timeout=self.request_timeout,
+                    session_timeout=self.session_timeout,
+                    step_timeout=self.step_timeout,
+                    prefetch_batches=self.prefetch_batches,
+                    sender_threads=self.sender_threads,
+                    revision=self.revision,
+                    token=self.token,
+                    quant_type=self.quant_type,
+                    tensor_parallel_devices=self.tensor_parallel_devices,
+                    should_validate_reachability=self.should_validate_reachability,
+                    start=True,
+                )
+            except BlockLoadingOutOfMemoryError as exc:
+                if exc.loaded_blocks <= 0:
+                    logger.error(
+                        "Out of memory before loading the first transformer block. Original error: %s",
+                        exc.original_exception,
+                    )
+                    raise exc.original_exception
+
+                previous_num_blocks = self.num_blocks
+                self.num_blocks = exc.loaded_blocks
+                self.attn_cache_bytes = self._cache_bytes_per_block * self.num_blocks
+                self._update_throughput_info()
+
+                gib = 1024**3
+                logger.warning(
+                    "Ran out of GPU memory while loading blocks (attempted %s, loaded %s). "
+                    "Retrying with num_blocks=%s (attn cache %.2f GiB).",
+                    previous_num_blocks,
+                    exc.loaded_blocks,
+                    self.num_blocks,
+                    self.attn_cache_bytes / gib,
+                )
+                logger.debug("Original OOM exception: %s", exc.original_exception)
+
+                self._clean_memory_and_fds()
+                continue
+
             try:
                 self.module_container.ready.wait()
 
@@ -581,13 +656,20 @@ class ModuleContainer(threading.Thread):
 
             if should_validate_reachability:
                 validate_reachability(dht.peer_id)
-        except:
+        except Exception as exc:
             logger.debug("Shutting down backends")
             for backend in blocks.values():
                 backend.shutdown()
 
             dht_announcer.announce(ServerState.OFFLINE)
             logger.info(f"Announced that blocks {module_uids} are offline")
+
+            if _is_out_of_memory_error(exc):
+                raise BlockLoadingOutOfMemoryError(
+                    attempted_blocks=len(block_indices),
+                    loaded_blocks=len(blocks),
+                    original_exception=exc,
+                ) from exc
             raise
 
         return cls(
