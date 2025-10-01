@@ -1,11 +1,13 @@
 #!/bin/bash
 
-# Enable job control and safer scripting defaults
+# Cross-platform swarm launcher (macOS & Linux)
 set -m
 set -o pipefail
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 PYTHON_PID=""
+PYTHON_PGID=""
+
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     if command -v python >/dev/null 2>&1; then
         PYTHON_BIN=python
@@ -19,20 +21,26 @@ cleanup() {
     if [ -n "${PYTHON_PID:-}" ]; then
         echo "Shutting down the server and its child processes..."
         if kill -0 "$PYTHON_PID" 2>/dev/null; then
-            kill "$PYTHON_PID" 2>/dev/null || true
+            if [ -n "${PYTHON_PGID:-}" ]; then
+                kill -TERM "-${PYTHON_PGID}" 2>/dev/null || true
+                sleep 1
+                kill -KILL "-${PYTHON_PGID}" 2>/dev/null || true
+            else
+                kill "$PYTHON_PID" 2>/dev/null || true
+            fi
             wait "$PYTHON_PID" 2>/dev/null || true
         fi
         echo "Cleanup complete"
     fi
 }
 
-# Check if .env file exists
+trap cleanup SIGINT SIGTERM EXIT
+
 if [ ! -f ".env" ]; then
     echo "Error: .env file not found. Please create a .env file with required variables."
     exit 1
 fi
 
-# Check if models file exists
 if [ ! -f "models" ]; then
     echo "Error: models file not found. Please create a models file with a list of models."
     exit 1
@@ -40,27 +48,29 @@ fi
 
 source models
 
-# Display model selection menu
 echo "Please select a model:"
 for i in "${!MODELS[@]}"; do
-    echo "$((i+1)). ${MODELS[i]}"
+    echo "$((i + 1)). ${MODELS[i]}"
 done
 
-# Get user selection
 while true; do
-    read -p "Enter the number of your choice (1-${#MODELS[@]}): " choice
+    read -r -p "Enter the number of your choice (1-${#MODELS[@]}): " choice
     if [[ "$choice" =~ ^[1-9][0-9]*$ && "$choice" -le "${#MODELS[@]}" ]]; then
-        MODEL=${MODELS[$((choice-1))]}
+        MODEL=${MODELS[$((choice - 1))]}
         break
     else
         echo "Invalid choice. Please enter a number between 1 and ${#MODELS[@]}."
     fi
 done
 
+PORT=${PORT:-31331}
+ALLOC_TIMEOUT=${ALLOC_TIMEOUT:-6000}
+ATTN_CACHE_TOKENS=${ATTN_CACHE_TOKENS:-64000}
+DISK_SPACE=${DISK_SPACE:-120GB}
+INFERENCE_MAX_LENGTH=${INFERENCE_MAX_LENGTH:-136192}
+P2P_FILE=${P2P_FILE:-./dev.id}
 
-PORT=31331
-ALLOC_TIMEOUT=6000
-ATTN_CACHE_TOKENS=64000
+PUBLIC_IP=""
 if command -v curl >/dev/null 2>&1; then
     PUBLIC_IP=$(curl -fsS ipinfo.io/ip 2>/dev/null)
 fi
@@ -79,9 +89,6 @@ if [ -z "$PUBLIC_IP" ]; then
     echo "Warning: Unable to determine public IP automatically; defaulting to 127.0.0.1"
     PUBLIC_IP="127.0.0.1"
 fi
-P2P_FILE='./dev.id'
-DISK_SPACE='120GB'
-INFERENCE_MAX_LENGTH=136192
 
 source .env
 
@@ -90,7 +97,6 @@ if [ -z "${HF_TOKEN:-}" ]; then
     exit 1
 fi
 
-# Detect best available device / dtype / quantization settings unless overridden
 DETECTED_SETTINGS=$("$PYTHON_BIN" -c 'import torch
 device = "cpu"
 dtype = "float32"
@@ -118,25 +124,23 @@ fi
 
 echo "Using device=$DEVICE, torch_dtype=$TORCH_DTYPE, quant_type=$QUANT_TYPE"
 
-# Set a trap to call the cleanup function upon receiving SIGINT (Ctrl+C)
-trap cleanup SIGINT SIGTERM EXIT
-
 "$PYTHON_BIN" -m agentgrid.cli.run_server \
     --public_ip "$PUBLIC_IP" \
     --device "$DEVICE" \
     --torch_dtype "$TORCH_DTYPE" \
     --quant_type "$QUANT_TYPE" \
-    --port $PORT \
+    --port "$PORT" \
     --token "$HF_TOKEN" \
-    --attn_cache_tokens "${ATTN_CACHE_TOKENS}" \
-    --inference_max_length "${INFERENCE_MAX_LENGTH}" \
+    --attn_cache_tokens "$ATTN_CACHE_TOKENS" \
+    --inference_max_length "$INFERENCE_MAX_LENGTH" \
     --identity_path "$P2P_FILE" \
-    --throughput 'eval' \
+    --throughput eval \
     --new_swarm \
     "$MODEL" &
 
 PYTHON_PID=$!
+PYTHON_PGID=$(ps -o pgid= "$PYTHON_PID" | tr -d ' ')
 
-echo "Server started with PID: $PYTHON_PID. Press Ctrl+C to stop."
+echo "Server started with PID: $PYTHON_PID (PGID: $PYTHON_PGID). Press Ctrl+C to stop."
 
-wait $PYTHON_PID
+wait "$PYTHON_PID"

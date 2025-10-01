@@ -68,6 +68,10 @@ class AgentGridLayer(CacheLayerMixin):
 
             if prefix_length < new_length:
                 update_slice = slice(prefix_length, new_length)
+                if key_cache_shard.device.type in {"cuda", "mps"} and key_state_shard.ndim == 4:
+                    key_state_shard = key_state_shard.contiguous(memory_format=torch.channels_last)
+                if value_cache_shard.device.type in {"cuda", "mps"} and value_state_shard.ndim == 4:
+                    value_state_shard = value_state_shard.contiguous(memory_format=torch.channels_last)
                 key_cache_shard[:, :, update_slice, :] = key_state_shard[:, :, update_slice, :]
                 value_cache_shard[:, :, update_slice, :] = value_state_shard[:, :, update_slice, :]
         self._seq_length = max(self._seq_length, new_length)
