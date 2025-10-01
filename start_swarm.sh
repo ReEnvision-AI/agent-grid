@@ -117,6 +117,7 @@ read -r DETECTED_DEVICE DETECTED_DTYPE DETECTED_QUANT <<<"${DETECTED_SETTINGS:-c
 DEVICE=${AG_DEVICE:-$DETECTED_DEVICE}
 TORCH_DTYPE=${AG_TORCH_DTYPE:-$DETECTED_DTYPE}
 QUANT_TYPE=${AG_QUANT_TYPE:-$DETECTED_QUANT}
+WARMUP_TOKENS_INTERVAL=${AG_WARMUP_TOKENS_INTERVAL:-}
 
 if [ "$DEVICE" != "cuda" ]; then
     QUANT_TYPE="none"
@@ -124,19 +125,27 @@ fi
 
 echo "Using device=$DEVICE, torch_dtype=$TORCH_DTYPE, quant_type=$QUANT_TYPE"
 
-"$PYTHON_BIN" -m agentgrid.cli.run_server \
-    --public_ip "$PUBLIC_IP" \
-    --device "$DEVICE" \
-    --torch_dtype "$TORCH_DTYPE" \
-    --quant_type "$QUANT_TYPE" \
-    --port "$PORT" \
-    --token "$HF_TOKEN" \
-    --attn_cache_tokens "$ATTN_CACHE_TOKENS" \
-    --inference_max_length "$INFERENCE_MAX_LENGTH" \
-    --identity_path "$P2P_FILE" \
-    --throughput eval \
-    --new_swarm \
-    "$MODEL" &
+CMD=(
+    "$PYTHON_BIN" -m agentgrid.cli.run_server
+    --public_ip "$PUBLIC_IP"
+    --device "$DEVICE"
+    --torch_dtype "$TORCH_DTYPE"
+    --quant_type "$QUANT_TYPE"
+    --port "$PORT"
+    --token "$HF_TOKEN"
+    --attn_cache_tokens "$ATTN_CACHE_TOKENS"
+    --inference_max_length "$INFERENCE_MAX_LENGTH"
+    --identity_path "$P2P_FILE"
+    --throughput eval
+    --new_swarm
+    "$MODEL"
+)
+
+if [ -n "$WARMUP_TOKENS_INTERVAL" ]; then
+    CMD+=(--warmup_tokens_interval "$WARMUP_TOKENS_INTERVAL")
+fi
+
+"${CMD[@]}" &
 
 PYTHON_PID=$!
 PYTHON_PGID=$(ps -o pgid= "$PYTHON_PID" | tr -d ' ')
