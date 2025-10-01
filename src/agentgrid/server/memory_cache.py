@@ -288,7 +288,7 @@ class MemoryCache:
         if bytes_freed > 0:
             self._memory_freed_event.set()
             self._eviction_count += 1
-        logger.info(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
+        logger.debug(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
 
     def _needs_compaction(self) -> bool:
         """Check if any pools have enough tensors to warrant compaction."""
@@ -370,7 +370,7 @@ class MemoryCache:
             self._last_compaction_found_work = False
             return
         
-        logger.info("Running memory pool compaction...")
+        logger.debug("Running memory pool compaction...")
         compaction_work_done = False
         
         for device, device_pools in self._free_pools.items():
@@ -379,7 +379,7 @@ class MemoryCache:
                 # We iterate over a copy of keys since we might modify the dictionary
                 for numel, pool in list(dtype_pools.items()):
                     if len(pool) >= self.COMPACTION_THRESHOLD:
-                        logger.info(
+                        logger.debug(
                             f"Compacting pool on {device}:{dtype} with {len(pool)} tensors of size {numel}"
                         )
                         initial_pool_size = len(pool)
@@ -406,11 +406,11 @@ class MemoryCache:
                             dtype_pools.move_to_end(new_numel)
                             compaction_work_done = True
                         
-                        logger.info(f"Compaction finished for pool. Size: {initial_pool_size} -> {len(pool)}")
+                        logger.debug(f"Compaction finished for pool. Size: {initial_pool_size} -> {len(pool)}")
         
         self._last_compaction_found_work = compaction_work_done
         if compaction_work_done:
-            logger.info("Memory pool compaction completed with work done")
+            logger.debug("Memory pool compaction completed with work done")
         else:
             logger.debug("Memory pool compaction completed with no work needed")
 
@@ -430,7 +430,7 @@ class MemoryCache:
             if len(pattern) > len(history) and pattern[: len(history)] == history:
                 # Found a matching pattern, predict the next step
                 next_descriptor = pattern[len(history)]
-                logger.info(f"Predictive allocation for session {session_id}: found pattern, next is {next_descriptor}")
+                logger.debug(f"Predictive allocation for session {session_id}: found pattern, next is {next_descriptor}")
 
                 # Attempt to find and reserve a tensor from free pools
                 numel = next_descriptor.numel()
@@ -441,7 +441,7 @@ class MemoryCache:
                         pre_allocated_tensor = dtype_pools[numel].pop()
                         self._pre_allocated_tensors.setdefault(session_id, []).append(pre_allocated_tensor)
                         self._pre_allocation_timestamps[session_id] = time.time()
-                        logger.info(f"Pre-allocated tensor for session {session_id}")
+                        logger.debug(f"Pre-allocated tensor for session {session_id}")
                         # We found a prediction and pre-allocated, we are done for this step
                         return
 
@@ -475,7 +475,7 @@ class MemoryCache:
                     history = self._active_sessions.pop(session_id)
                     patterns = self._session_patterns.setdefault(session_id, [])
                     patterns.append(history)
-                    logger.info(f"Ended session {session_id}, stored allocation pattern with {len(history)} steps.")
+                    logger.debug(f"Ended session {session_id}, stored allocation pattern with {len(history)} steps.")
                 if session_id in self._pre_allocated_tensors: # Clean up any leftover pre-allocations
                     for tensor in self._pre_allocated_tensors.pop(session_id):
                         # Return tensor to the free pool
@@ -503,7 +503,7 @@ class MemoryCache:
                         for i, tensor in enumerate(pre_allocated_pool):
                             if tensor.numel() == numel and tensor.dtype == descr.dtype and tensor.device == descr.device:
                                 reused_tensor = pre_allocated_pool.pop(i)
-                                logger.info(f"Used pre-allocated tensor for session {session_id}")
+                                logger.debug(f"Used pre-allocated tensor for session {session_id}")
                                 break
                         if not pre_allocated_pool:
                             del self._pre_allocated_tensors[session_id]
