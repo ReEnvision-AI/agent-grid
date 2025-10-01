@@ -98,7 +98,10 @@ def get_server_throughput(
     average_blocks_used = (num_blocks + 1) / 2
     throughput = throughput_info["forward_rps"] / average_blocks_used
 
-    network_rps = throughput_info["network_rps"] * (relay_penalty if reachable_via_relay else 1)
+    network_rps = throughput_info.get("network_rps")
+    if network_rps is None:
+        network_rps = (100e6 / (config.hidden_size * 16))  # fall back to default speedtest heuristic
+    network_rps *= relay_penalty if reachable_via_relay else 1
     throughput = min(throughput, network_rps)
 
     throughput_info["throughput"] = throughput
@@ -121,32 +124,52 @@ def measure_throughput_info(
 
     block = get_model_block(config)
     block = block.to(dtype)
-    block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
+
+    inference_tokens, inference_steps = (1, 100)
+    forward_tokens, forward_steps = (1024, 10)
+    if device.type != "cuda":
+        inference_steps = 40
+        forward_tokens = min(256, max(1, config.hidden_size // 16))
+        forward_steps = 4
+
+    try:
+        block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
+
+        inference_rps = measure_compute_rps(
+            config,
+            block,
+            device,
+            dtype,
+            quant_type=quant_type,
+            tensor_parallel_devices=tensor_parallel_devices,
+            n_tokens=inference_tokens,
+            n_steps=inference_steps,
+            inference=True,
+        )
+        forward_rps = measure_compute_rps(
+            config,
+            block,
+            device,
+            dtype,
+            quant_type=quant_type,
+            tensor_parallel_devices=tensor_parallel_devices,
+            n_tokens=forward_tokens,
+            n_steps=forward_steps,
+            inference=False,
+        )
+    finally:
+        del block
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps":
+            torch.mps.empty_cache()
+
+    network_rps = measure_network_rps(config) if device.type == "cuda" else None
 
     return {
-        "inference_rps": measure_compute_rps(
-            config,
-            block,
-            device,
-            dtype,
-            quant_type=quant_type,
-            tensor_parallel_devices=tensor_parallel_devices,
-            n_tokens=1,
-            n_steps=100,
-            inference=True,
-        ),
-        "forward_rps": measure_compute_rps(
-            config,
-            block,
-            device,
-            dtype,
-            quant_type=quant_type,
-            tensor_parallel_devices=tensor_parallel_devices,
-            n_tokens=1024,
-            n_steps=10,
-            inference=False,
-        ),
-        "network_rps": measure_network_rps(config),
+        "inference_rps": inference_rps,
+        "forward_rps": forward_rps,
+        "network_rps": network_rps,
     }
 
 

@@ -97,6 +97,8 @@ def convert_block(
             )
             add_adapter_to_block(block, block_index, adapter_name, adapter_config, adapter_state_dict)
 
+    block.eval()
+
     return block
 
 

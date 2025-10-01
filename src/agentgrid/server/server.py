@@ -203,6 +203,12 @@ class Server:
 
         if self.device.type == "mps":
             logger.info("Using Apple Metal (MPS) backend")
+            if hasattr(torch.backends, "mps"):
+                try:
+                    torch.backends.mps.matmul.allow_fp16_reduction(True)
+                except AttributeError:
+                    logger.debug("MPS backend does not expose matmul fp16 reduction toggle")
+            torch.set_float32_matmul_precision("medium")
         elif self.device.type == "cpu":
             logger.info(
                 "Using CPU backend; throughput will be significantly lower than CUDA or MPS."
