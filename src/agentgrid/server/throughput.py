@@ -272,7 +272,11 @@ def synchronize(device: torch.device):
 
 
 def get_device_name(device: torch.device) -> str:
-    return f"{torch.cuda.get_device_name(device)} GPU" if device.type == "cuda" else device.type.upper()
+    if device.type == "cuda":
+        return f"{torch.cuda.get_device_name(device)} GPU"
+    if device.type == "mps":
+        return "Apple MPS"
+    return device.type.upper()
 
 
 def get_dtype_name(dtype: torch.dtype, quant_type: QuantType) -> str:

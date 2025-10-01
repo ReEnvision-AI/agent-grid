@@ -46,7 +46,21 @@ git clone https://github.com/reenvision-ai/agent-grid.git
 cd agent-grid  
 pip install .
 ```
-The project dependencies are listed in the `setup.cfg` file and include libraries like `torch`, `transformers`, `hivemind`, and `tensor_parallel`.
+The project dependencies are listed in `pyproject.toml`. Pick the extra that matches your host before installing:
+```Bash
+# Minimal CPU bootstrap node (works everywhere)
+pip install .[bootstrap]
+
+# Recommended general-purpose inference stack (CPU, MPS, or CUDA)
+pip install .[inference]
+
+# macOS convenience alias that reuses the inference stack
+pip install .[macos]
+
+# Add Linux GPU-specific optimizations like bitsandbytes and Triton
+pip install .[full]
+```
+`agent-grid[gpu]` can be layered on top of the inference extra if you only want the CUDA helpers. On macOS, the `gpu` extra is skipped automatically because its dependencies are gated to Linux.
 ## Running a Server
 You can start a server and join the public swarm using the provided shell scripts. The `start_server.sh` and `start_swarm.sh` scripts provide a convenient way to launch a server with the necessary configurations.
 First, you'll need to create a `.env` file with your Hugging Face token:

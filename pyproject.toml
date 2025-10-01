@@ -75,11 +75,10 @@ bootstrap = [
     "transformers[torch]==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
     "hivemind[cpu] @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
 ]
-full = [
-    # GPU and full inference dependencies
+inference = [
+    # Cross-platform inference dependencies
     "torch==2.6.0",
     "hivemind @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
-    "bitsandbytes==0.46.0",
     "accelerate==1.7.0",
     "huggingface-hub==0.34.3",
     "tokenizers==0.21.2",
@@ -89,8 +88,21 @@ full = [
     "peft==0.8.2",
     "safetensors==0.5.3",
     "numpy==2.3.1",
-    "triton==3.2.0",
     "transformers==4.55.4",  # if you change this, please also change version assert in agentgrid/__init__.py
+]
+gpu = [
+    # GPU-only acceleration dependencies (Linux-supported)
+    "bitsandbytes==0.46.0; platform_system == 'Linux'",
+    "triton==3.2.0; platform_system == 'Linux'",
+]
+macos = [
+    # Convenience extra for Apple Silicon / Intel macOS hosts
+    "agent-grid[inference]",
+]
+full = [
+    # Default full install keeps Linux GPU acceleration while remaining macOS-friendly
+    "agent-grid[inference]",
+    "agent-grid[gpu]",
 ]
 dev = [
     "pytest>=8.0.0",

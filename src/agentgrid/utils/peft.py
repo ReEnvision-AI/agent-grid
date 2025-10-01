@@ -3,7 +3,14 @@ import re
 import time
 from typing import List, Optional, Sequence, Union
 
-import bitsandbytes as bnb
+try:  # pragma: no cover - exercised only on platforms without bitsandbytes
+    import bitsandbytes as bnb
+except Exception as exc:  # noqa: BLE001 - we want the original exception chained for context
+    bnb = None  # type: ignore[assignment]
+    _BNB_IMPORT_ERROR: Optional[BaseException] = exc
+else:
+    _BNB_IMPORT_ERROR = None
+
 import torch
 import torch.nn as nn
 import transformers
@@ -18,11 +25,21 @@ from safetensors.torch import load_file
 from transformers.utils.hub import cached_file
 
 from agentgrid.server.block_utils import get_model_block, resolve_block_dtype
-from agentgrid.utils.convert_block import QuantType
 from agentgrid.utils.disk_cache import allow_cache_reads, allow_cache_writes, free_disk_space_for
 from agentgrid.utils.misc import get_size_in_bytes
 
 logger = get_logger(__name__)
+
+if _BNB_IMPORT_ERROR is not None:
+    logger.debug("bitsandbytes import failed; quantized adapters will be unavailable: %s", _BNB_IMPORT_ERROR)
+
+
+_LORA_BASE_CLASSES = [lora.Linear]
+if hasattr(lora, "Linear8bitLt"):
+    _LORA_BASE_CLASSES.append(lora.Linear8bitLt)
+if hasattr(lora, "Linear4bit"):
+    _LORA_BASE_CLASSES.append(lora.Linear4bit)
+_LORA_CLASS_TUPLE = tuple(_LORA_BASE_CLASSES)
 
 
 COMMON_LAYERS_PATTERN = ["layers", "h", "block", "blocks", "layer"]
@@ -181,12 +198,34 @@ class LoraLinear(AdapterContextMixin, lora.Linear):
         self.is_target_conv_1d_layer = False
 
 
-class LoraLinear8bitLt(LoraLinear, lora.Linear8bitLt):
-    """LoRA linear 8-bit with outliers that uses adapter selected via using_adapter"""
+if hasattr(lora, "Linear8bitLt") and bnb is not None:
+
+    class LoraLinear8bitLt(LoraLinear, lora.Linear8bitLt):
+        """LoRA linear 8-bit with outliers that uses adapter selected via using_adapter"""
 
 
-class LoraLinear4bit(LoraLinear, lora.Linear4bit):
-    """LoRA linear 4-bit that uses adapter selected via using_adapter"""
+else:  # pragma: no cover - exercised when bitsandbytes / 8bit LoRA is unavailable
+
+    class LoraLinear8bitLt(LoraLinear):
+        """Fallback wrapper when 8-bit LoRA layers are unavailable"""
+
+        def __init__(self, base_layer, adapter_name: str):
+            super().__init__(base_layer, adapter_name)
+
+
+if hasattr(lora, "Linear4bit") and bnb is not None:
+
+    class LoraLinear4bit(LoraLinear, lora.Linear4bit):
+        """LoRA linear 4-bit that uses adapter selected via using_adapter"""
+
+
+else:  # pragma: no cover - exercised when bitsandbytes / 4bit LoRA is unavailable
+
+    class LoraLinear4bit(LoraLinear):
+        """Fallback wrapper when 4-bit LoRA layers are unavailable"""
+
+        def __init__(self, base_layer, adapter_name: str):
+            super().__init__(base_layer, adapter_name)
 
 
 def create_lora_adapter(block):
@@ -197,9 +236,9 @@ def create_lora_adapter(block):
             lora_class = None
             if isinstance(child, nn.Linear):
                 lora_class = LoraLinear
-            elif isinstance(child, bnb.nn.Linear8bitLt):
+            elif bnb is not None and isinstance(child, bnb.nn.Linear8bitLt):
                 lora_class = LoraLinear8bitLt
-            elif isinstance(child, bnb.nn.Linear4bit):
+            elif bnb is not None and isinstance(child, bnb.nn.Linear4bit):
                 lora_class = LoraLinear4bit
             if lora_class:
                 lora_wrapped_child = lora_class(
@@ -216,7 +255,7 @@ def add_adapter_to_block(block, block_index, adapter_name, peft_config, peft_sta
 
     for _, module in block.named_modules():
         for child_name, child in module.named_children():
-            if not isinstance(child, (lora.Linear, lora.Linear8bitLt, lora.Linear4bit)):
+            if not isinstance(child, _LORA_CLASS_TUPLE):
                 continue
 
             if child_name in peft_config["target_modules"] or (
