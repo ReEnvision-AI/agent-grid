@@ -461,7 +461,14 @@ class MemoryCache:
         # Step 2: Evict memory if cache is over budget
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
             total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
-        if total_size > self.max_size_bytes:
+
+        if self.max_size_bytes == 2**64 - 1:
+            should_evict = False
+        else:
+            evict_threshold = self.max_size_bytes + int(self.max_size_bytes * 0.05)
+            should_evict = total_size > evict_threshold
+
+        if should_evict:
             self._evict_memory(total_size - self.max_size_bytes)
 
         # Step 3: read creation/deletion requests from connection handlers

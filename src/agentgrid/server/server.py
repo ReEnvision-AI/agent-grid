@@ -113,6 +113,7 @@ class Server:
         use_relay: bool = True,
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
+        warmup_tokens_interval: Optional[int] = None,
         **kwargs,
     ):
         """Create a server with one or more bloom blocks. See run_server.py for documentation."""
@@ -392,6 +393,7 @@ class Server:
         self.balance_quality = balance_quality
         self.mean_balance_check_period = mean_balance_check_period
         self.mean_block_selection_delay = mean_block_selection_delay
+        self.warmup_tokens_interval = warmup_tokens_interval
 
         self.module_container = None
         self.stop = threading.Event()
@@ -534,6 +536,7 @@ class Server:
                     quant_type=self.quant_type,
                     tensor_parallel_devices=self.tensor_parallel_devices,
                     should_validate_reachability=self.should_validate_reachability,
+                    warmup_tokens_interval=self.warmup_tokens_interval,
                     start=True,
                 )
             except BlockLoadingOutOfMemoryError as exc:
@@ -660,6 +663,7 @@ class ModuleContainer(threading.Thread):
         quant_type: QuantType,
         tensor_parallel_devices: Sequence[torch.device],
         should_validate_reachability: bool,
+        warmup_tokens_interval: Optional[int] = None,
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
@@ -715,6 +719,7 @@ class ModuleContainer(threading.Thread):
                     memory_cache=memory_cache,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
+                    warmup_tokens_interval=warmup_tokens_interval,
                     args_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression

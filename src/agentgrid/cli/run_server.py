@@ -1,19 +1,11 @@
 import argparse
-import logging
 
 import configargparse
-import torch
-from hivemind.proto.runtime_pb2 import CompressionType
-from hivemind.utils import limits
-from hivemind.utils.logging import get_logger
-from humanfriendly import parse_size
 
 from agentgrid.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
-from agentgrid.server.server import Server
 from agentgrid.utils.convert_block import QuantType
+from agentgrid.launcher.server import run_server_from_config
 from agentgrid.utils.version import validate_version
-
-logger = get_logger(__name__)
 
 
 def main():
@@ -163,70 +155,25 @@ def main():
 
     parser.add_argument("--adapters", nargs='*', default=(),
                         help="List of pre-loaded LoRA adapters that can be used for inference or training")
+    parser.add_argument(
+        "--warmup_tokens_interval",
+        type=int,
+        default=None,
+        help="Run a short warmup pass after processing this many tokens (optional)",
+    )
 
     # fmt:on
     args = vars(parser.parse_args())
     args.pop("config", None)
 
-    args["converted_model_name_or_path"] = args.pop("model") or args["converted_model_name_or_path"]
-
-    host_maddrs = args.pop("host_maddrs")
-    port = args.pop("port")
-    if port is not None:
-        assert host_maddrs is None, "You can't use --port and --host_maddrs at the same time"
+    if args.get("model") and not args.get("converted_model_name_or_path"):
+        args["converted_model_name_or_path"] = args.pop("model")
     else:
-        port = 0
-    if host_maddrs is None:
-        host_maddrs = [f"/ip4/0.0.0.0/tcp/{port}", f"/ip6/::/tcp/{port}"]
+        args.pop("model", None)
 
-    announce_maddrs = args.pop("announce_maddrs")
-    public_ip = args.pop("public_ip")
-    if public_ip is not None:
-        assert announce_maddrs is None, "You can't use --public_ip and --announce_maddrs at the same time"
-        assert port != 0, "Please specify a fixed non-zero --port when you use --public_ip (e.g., --port 31337)"
-        announce_maddrs = [f"/ip4/{public_ip}/tcp/{port}"]
+    validate_version()
 
-    args["startup_timeout"] = args.pop("daemon_startup_timeout")
-
-    file_limit = args.pop("increase_file_limit")
-    if file_limit:
-        limits.logger.setLevel(logging.WARNING)
-        limits.increase_file_limit(file_limit, file_limit)
-
-    compression_type = args.pop("compression").upper()
-    compression = getattr(CompressionType, compression_type)
-
-    max_disk_space = args.pop("max_disk_space")
-    if max_disk_space is not None:
-        max_disk_space = parse_size(max_disk_space)
-    assert isinstance(
-        max_disk_space, (int, type(None))
-    ), "Unrecognized value for --max_disk_space. Correct examples: 1.5GB or 1500MB or 1572864000 (bytes)"
-
-    if args.pop("new_swarm"):
-        args["initial_peers"] = []
-
-    quant_type = args.pop("quant_type")
-    if quant_type is not None:
-        args["quant_type"] = QuantType[quant_type.upper()]
-
-    if not torch.backends.openmp.is_available():
-        # Necessary to prevent the server from freezing after forks
-        torch.set_num_threads(1)
-
-    server = Server(
-        **args,
-        host_maddrs=host_maddrs,
-        announce_maddrs=announce_maddrs,
-        compression=compression,
-        max_disk_space=max_disk_space,
-    )
-    try:
-        server.run()
-    except KeyboardInterrupt:
-        logger.info("Caught KeyboardInterrupt, shutting down")
-    finally:
-        server.shutdown()
+    run_server_from_config(args)
 
 
 if __name__ == "__main__":

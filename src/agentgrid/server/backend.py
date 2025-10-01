@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import threading
 from itertools import chain
 from typing import Any, Dict, Optional, Sequence, Tuple, TypeAlias, Union
 
@@ -137,6 +138,7 @@ class TransformerBackend(ModuleBackend):
         memory_cache: MemoryCache,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
+        warmup_tokens_interval: int | None = None,
         **kwargs,
     ):
         import agentgrid.utils.peft as _peft_module
@@ -148,6 +150,8 @@ class TransformerBackend(ModuleBackend):
         self.config = config
         self.memory_cache = memory_cache
         self.max_chunk_size_bytes = max_chunk_size_bytes
+        self.warmup_tokens_interval = warmup_tokens_interval
+        self._tokens_since_warmup = 0
 
         for name, param in self.module.named_parameters():
             assert not param.requires_grad, f"Block parameters must not accumulate gradients, but {name} does"
@@ -167,6 +171,10 @@ class TransformerBackend(ModuleBackend):
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
+        self._warmup_tokens_interval = warmup_tokens_interval or 0
+        self._tokens_since_warmup = 0
+        self._warmup_lock = threading.Lock()
+        self._warmup_active = False
         self.shard_num_heads = []
         self.shard_num_kv_heads = []
         self.shard_head_dims = []
@@ -269,6 +277,7 @@ class TransformerBackend(ModuleBackend):
                     position_ids=position_ids,
                     position_embeddings=position_embeddings,
                 )
+                self._maybe_run_warmup(hidden_states, attention_mask, position_ids, position_embeddings)
             else:
                 output_hidden_states = torch.empty_like(hidden_states)
                 for offset in range(0, seq_len, max_chunk_length):
@@ -283,6 +292,9 @@ class TransformerBackend(ModuleBackend):
                     )
                     output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     layer_past = new_kvs
+                    self._maybe_run_warmup(
+                        hidden_states_chunk, attention_mask, position_ids, position_embeddings
+                    )
 
             if new_kvs is not None:
                 key_states, value_states = new_kvs
@@ -298,6 +310,78 @@ class TransformerBackend(ModuleBackend):
                         self.memory_cache.recycle_tensors(tensors_to_recycle)
 
             return (output_hidden_states,)
+
+    def _maybe_run_warmup(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        if not self.warmup_tokens_interval:
+            return
+        tokens_processed = hidden_states.shape[0] * hidden_states.shape[1]
+        if tokens_processed <= 0:
+            return
+        if self._warmup_tokens_interval <= 0:
+            return
+        self._tokens_since_warmup += tokens_processed
+        if self._tokens_since_warmup < self._warmup_tokens_interval:
+            return
+        self._tokens_since_warmup = 0
+        if self._warmup_active:
+            return
+        threading.Thread(
+            target=self._run_warmup,
+            args=(attention_mask, position_ids, position_embeddings),
+            daemon=True,
+        ).start()
+
+    def _run_warmup(
+        self,
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        if self.device.type not in {"cuda", "mps"}:
+            return
+        if not self._warmup_lock.acquire(blocking=False):
+            return
+        self._warmup_active = True
+        try:
+            with torch.inference_mode():
+                warmup_input = torch.zeros(
+                    (1, 1, self.config.hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                kwargs: Dict[str, Any] = {"use_cache": False, "layer_past": None}
+                if attention_mask is not None:
+                    kwargs["attention_mask"] = torch.ones(
+                        attention_mask.size(0), 1, device=attention_mask.device, dtype=attention_mask.dtype
+                    )
+                if position_ids is not None:
+                    kwargs["position_ids"] = torch.zeros(
+                        (position_ids.size(0), 1), device=position_ids.device, dtype=position_ids.dtype
+                    )
+                if position_embeddings is not None:
+                    pe: list[torch.Tensor | Any] = []
+                    for item in position_embeddings:
+                        if isinstance(item, torch.Tensor) and item.ndim >= 2:
+                            pe.append(torch.zeros_like(item[:, :1]))
+                        else:
+                            pe.append(item)
+                    kwargs["position_embeddings"] = tuple(pe)
+                self.module.forward(warmup_input, **kwargs)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            elif self.device.type == "mps":
+                torch.mps.synchronize()
+        except Exception:  # pragma: no cover - warmup best-effort
+            logger.debug("Warmup step failed", exc_info=True)
+        finally:
+            self._warmup_active = False
+            self._warmup_lock.release()
 
     def _flatten_tensors(self, tensor_like: Any) -> list[torch.Tensor]:
         if isinstance(tensor_like, PerDeviceTensors):
