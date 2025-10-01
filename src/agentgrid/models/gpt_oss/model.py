@@ -88,11 +88,9 @@ class DistributedGptOssModel(FromPretrainedMixin, PTuneMixin, GptOssModel):
             "cache_position": cache_position,
             "past_key_values": past_key_values,
         }
-        full_mask_kwargs = mask_kwargs.copy()
-        full_mask_kwargs["past_key_values"] = None
         causal_mask_mapping = {
-            "full_attention": create_causal_mask(**full_mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**full_mask_kwargs),
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
         }
 
         hidden_states = inputs_embeds

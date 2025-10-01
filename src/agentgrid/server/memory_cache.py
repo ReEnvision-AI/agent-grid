@@ -53,10 +53,19 @@ class MemoryCache:
         self._memory_pressure_threshold = 0.8  # Compact more aggressively when cache is 80% full
         self._last_compaction_found_work = False  # Track if last compaction actually did work
 
+        # Memory monitoring
+        self._allocation_count = 0
+        self._eviction_count = 0
+        self._compaction_count = 0
+        self._last_monitoring_log = time.time()
+        self._monitoring_interval = 60.0  # Log memory stats every 60 seconds
+
         # Predictive allocation
         self._session_patterns: Dict[str, List[List[TensorDescriptor]]] = {}
         self._active_sessions: Dict[str, List[TensorDescriptor]] = {}
         self._pre_allocated_tensors: Dict[str, List[torch.Tensor]] = {}
+        self._pre_allocation_timestamps: Dict[str, float] = {}
+        self._pre_allocation_timeout = 300.0  # 5 minutes timeout for pre-allocated tensors
 
     @property
     def current_size_bytes(self) -> int:
@@ -76,8 +85,9 @@ class MemoryCache:
 
     @property
     def bytes_left(self) -> int:
-        with self._pooled_size_bytes.get_lock():
-            return self.max_size_bytes - (self.current_size_bytes + self._pooled_size_bytes.value)
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+            return max(0, self.max_size_bytes - total_used)
 
     @property
     def handle_counter(self) -> int:
@@ -162,8 +172,10 @@ class MemoryCache:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
                     self.current_size_bytes += alloc_size
                     self.handle_counter += len(handles)  # note: this will eventually overflow and it is okay
+                    self._allocation_count += 1
                     command_info = {"session_id": session_id} if session_id else None
                     self._pipe_send.send((handles, descriptors, command_info))
+                    self._log_memory_stats()
                     return handles
         except TimeoutError:
             raise AllocationFailed(f"Could not allocate {alloc_size} (timeout={timeout})")
@@ -186,8 +198,8 @@ class MemoryCache:
                     raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
 
                 async with enter_asynchronously(self._lock_acquire_memory):
-                    with self._pooled_size_bytes.get_lock():
-                        current_total_size = self.current_size_bytes + self._pooled_size_bytes.value
+                    with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                        current_total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
                     if current_total_size + alloc_size > self.max_size_bytes:
                         if timeout == 0:
                             raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
@@ -225,8 +237,8 @@ class MemoryCache:
         timeout = timeout if timeout != float("inf") else None
         deadline = None if timeout is None else time.perf_counter() + timeout
         while True:
-            with self._pooled_size_bytes.get_lock():
-                current_total_size = self.current_size_bytes + self._pooled_size_bytes.value
+            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                current_total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
             if current_total_size + allocated_size <= self.max_size_bytes:
                 break
 
@@ -275,6 +287,7 @@ class MemoryCache:
 
         if bytes_freed > 0:
             self._memory_freed_event.set()
+            self._eviction_count += 1
         logger.info(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
 
     def _needs_compaction(self) -> bool:
@@ -306,8 +319,8 @@ class MemoryCache:
 
     def _get_memory_pressure(self) -> float:
         """Get current memory pressure as a ratio of used/max memory."""
-        with self._pooled_size_bytes.get_lock():
-            total_used = self.current_size_bytes + self._pooled_size_bytes.value
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
         return total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
 
     def _calculate_adaptive_interval(self) -> int:
@@ -410,6 +423,9 @@ class MemoryCache:
         if not history:
             return
 
+        # Clean up expired pre-allocations
+        self._cleanup_expired_preallocations()
+
         for pattern in self._session_patterns.get(session_id, []):
             if len(pattern) > len(history) and pattern[: len(history)] == history:
                 # Found a matching pattern, predict the next step
@@ -424,6 +440,7 @@ class MemoryCache:
                     if dtype_pools and numel in dtype_pools and dtype_pools[numel]:
                         pre_allocated_tensor = dtype_pools[numel].pop()
                         self._pre_allocated_tensors.setdefault(session_id, []).append(pre_allocated_tensor)
+                        self._pre_allocation_timestamps[session_id] = time.time()
                         logger.info(f"Pre-allocated tensor for session {session_id}")
                         # We found a prediction and pre-allocated, we are done for this step
                         return
@@ -439,10 +456,11 @@ class MemoryCache:
         if self._compaction_counter >= adaptive_interval:
             self._compact_memory_pools()
             self._compaction_counter = 0
+            self._compaction_count += 1
 
         # Step 2: Evict memory if cache is over budget
-        with self._pooled_size_bytes.get_lock():
-            total_size = self.current_size_bytes + self._pooled_size_bytes.value
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
         if total_size > self.max_size_bytes:
             self._evict_memory(total_size - self.max_size_bytes)
 
@@ -466,7 +484,7 @@ class MemoryCache:
                         dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
                         numel_pool = dtype_pool.setdefault(tensor.numel(), [])
                         numel_pool.append(tensor)
-                continue
+                    self._pre_allocation_timestamps.pop(session_id, None)
 
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
@@ -489,6 +507,7 @@ class MemoryCache:
                                 break
                         if not pre_allocated_pool:
                             del self._pre_allocated_tensors[session_id]
+                            self._pre_allocation_timestamps.pop(session_id, None)
 
                     # Step 3b: If not found, try to fulfill from general free pools
                     if reused_tensor is None:
@@ -509,7 +528,7 @@ class MemoryCache:
                             descr.shape, dtype=descr.dtype, device=descr.device
                         )
                     assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
-                
+
                 if session_id: # After fulfilling request, try to predict and pre-allocate the next one
                     self._predict_and_preallocate(session_id)
 
@@ -536,6 +555,56 @@ class MemoryCache:
 
         # Step 4: Yield tensors
         yield tuple(self._allocated_tensors[handle] for handle in handles)
+
+    def _cleanup_expired_preallocations(self):
+        """Clean up pre-allocated tensors that have expired due to timeout."""
+        current_time = time.time()
+        expired_sessions = []
+
+        for session_id, timestamp in self._pre_allocation_timestamps.items():
+            if current_time - timestamp > self._pre_allocation_timeout:
+                expired_sessions.append(session_id)
+
+        for session_id in expired_sessions:
+            logger.warning(f"Cleaning up expired pre-allocations for session {session_id}")
+            if session_id in self._pre_allocated_tensors:
+                for tensor in self._pre_allocated_tensors.pop(session_id):
+                    # Return tensor to the free pool
+                    descr = TensorDescriptor.from_tensor(tensor)
+                    device_pool = self._free_pools.setdefault(descr.device, {})
+                    dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
+                    numel_pool = dtype_pool.setdefault(tensor.numel(), [])
+                    numel_pool.append(tensor)
+                self._pre_allocation_timestamps.pop(session_id, None)
+                continue
+
+    def _log_memory_stats(self):
+        """Log memory statistics for monitoring purposes."""
+        current_time = time.time()
+        if current_time - self._last_monitoring_log >= self._monitoring_interval:
+            gib = 1024**3
+            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+                memory_pressure = total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
+
+            logger.info(
+                f"Memory Cache Stats - "
+                f"Used: {total_used / gib:.2f} GiB ({memory_pressure * 100:.1f}%), "
+                f"Available: {self.bytes_left / gib:.2f} GiB, "
+                f"Allocations: {self._allocation_count}, "
+                f"Evictions: {self._eviction_count}, "
+                f"Compactions: {self._compaction_count}, "
+                f"Active Sessions: {len(self._active_sessions)}, "
+                f"Pre-allocated: {len(self._pre_allocated_tensors)}"
+            )
+
+            # Log warning if memory pressure is high
+            if memory_pressure > 0.9:
+                logger.warning(f"High memory pressure detected: {memory_pressure * 100:.1f}%")
+            elif memory_pressure > 0.75:
+                logger.info(f"Elevated memory pressure: {memory_pressure * 100:.1f}%")
+
+            self._last_monitoring_log = current_time
 
 
 class AllocationFailed(Exception):

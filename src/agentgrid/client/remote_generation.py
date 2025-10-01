@@ -39,18 +39,26 @@ class RemoteCacheLayer(CacheLayerMixin):
         pass
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
-        return self.seen_tokens, 0
+        query_length = cache_position.shape[0]
+        kv_length = self.seen_tokens + query_length
+        return kv_length, 0
 
 
 class RemotePastKeyValues(Cache):
-    """A mock cache that merely stores the number of seen tokens. It is used in `RemoteGenerationMixin`."""
+    """A lightweight cache proxy that only tracks how many tokens were seen remotely."""
 
     def __init__(self) -> None:
         super().__init__(layer_classes=RemoteCacheLayer)
         self.seen_tokens = 0
 
-    def update_seen(self, value: int):
+    def update_seen(self, value: int) -> None:
         self.seen_tokens += value
+        for layer in self.layers:
+            if hasattr(layer, "seen_tokens"):
+                layer.seen_tokens += value
+
+    def get_seq_length(self, layer_idx: int = 0, cache_position=None) -> int:
+        return self.seen_tokens
 
 
 _skipped_tokens = ContextVar("skipped_tokens", default=0)
@@ -142,6 +150,9 @@ class RemoteGenerationMixin(_SkipTokensMixin):
 
             if "past_key_values" not in kwargs:
                 kwargs["past_key_values"] = RemotePastKeyValues()
+            else:
+                seen = session.output_ids.shape[1] if session.output_ids is not None else 0
+                kwargs["past_key_values"].seen_tokens = seen
 
             result = super().generate(inputs, *args, **kwargs)
 
@@ -162,4 +173,3 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         # Suppress inappropriate "Both max_new_tokens and max_length" HF warning
         if "max_length" in kwargs and kwargs["max_length"] is None:
             del kwargs["max_length"]
-

@@ -43,6 +43,7 @@ class AgentGridLayer(CacheLayerMixin):
     def __init__(self, key_shards: Sequence[torch.Tensor] = None, value_shards: Sequence[torch.Tensor] = None):
         self.key_shards = key_shards
         self.value_shards = value_shards
+        self._seq_length = 0
 
     @property
     def keys(self) -> PerDeviceTensors:
@@ -69,10 +70,11 @@ class AgentGridLayer(CacheLayerMixin):
                 update_slice = slice(prefix_length, new_length)
                 key_cache_shard[:, :, update_slice, :] = key_state_shard[:, :, update_slice, :]
                 value_cache_shard[:, :, update_slice, :] = value_state_shard[:, :, update_slice, :]
+        self._seq_length = max(self._seq_length, new_length)
         return self.keys, self.values
 
     def get_seq_length(self, cache_position=None) -> int:
-        return self.keys.shape[2]
+        return self._seq_length
 
     def get_max_cache_shape(self) -> int:
         return self.keys.shape[2]
@@ -279,7 +281,12 @@ class TransformerBackend(ModuleBackend):
 
             if new_kvs is not None:
                 key_states, value_states = new_kvs
-                cache.update(key_states, value_states, 0, cache_kwargs={"prefix_length": inference_info.prefix_length})
+                try:
+                    cache.update(key_states, value_states, 0, cache_kwargs={"prefix_length": inference_info.prefix_length})
+                except Exception as e:
+                    logger.error(f"Cache update failed for block {self.name}: {e}")
+                    # Continue processing even if cache update fails
+                    pass
 
             return (output_hidden_states,)
 
@@ -295,8 +302,13 @@ class TransformerBackend(ModuleBackend):
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
         """If hypo_ids is specified, reorder elements of each cache tensor in-place by taking indices from hypo_ids"""
         if not is_dummy(hypo_ids):
-            for cache_tensor in cache_tensors:
-                cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
+            try:
+                for cache_tensor in cache_tensors:
+                    cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
+            except Exception as e:
+                logger.error(f"Cache reordering failed for block {self.name}: {e}")
+                # Continue processing even if cache reordering fails
+                pass
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         return self.forward_pool, self.inference_pool

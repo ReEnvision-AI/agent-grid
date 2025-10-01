@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Enable job contro
+# Enable job control
 set -m
 
 cleanup() {
@@ -43,7 +43,7 @@ done
 
 PORT=31331
 ALLOC_TIMEOUT=6000
-ATTN_CACHE_TOKENS=128000
+ATTN_CACHE_TOKENS=64000
 PUBLIC_IP=$(curl ipinfo.io/ip)
 P2P_FILE='./dev.id'
 DISK_SPACE='120GB'
