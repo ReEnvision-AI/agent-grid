@@ -152,6 +152,7 @@ class TransformerBackend(ModuleBackend):
 
         max_batch_size = self.forward_pool.max_batch_size
         device = self.module.devices[self.module.output_device_index]
+        self.device = device
         self.inference_pool = PrioritizedTaskPool(
             self.inference_step, max_batch_size=max_batch_size, device=device, name=f"{self.name}_inference"
         )  # note: inference_pools may be merged later, see merge_inference_pools_inplace
@@ -287,8 +288,24 @@ class TransformerBackend(ModuleBackend):
                     logger.error(f"Cache update failed for block {self.name}: {e}")
                     # Continue processing even if cache update fails
                     pass
+                finally:
+                    if self.device.type == "mps":
+                        tensors_to_recycle = self._flatten_tensors((key_states, value_states))
+                        self.memory_cache.recycle_tensors(tensors_to_recycle)
 
             return (output_hidden_states,)
+
+    def _flatten_tensors(self, tensor_like: Any) -> list[torch.Tensor]:
+        if isinstance(tensor_like, PerDeviceTensors):
+            return list(getattr(tensor_like, "tensor_shards", [tensor_like]))
+        if isinstance(tensor_like, torch.Tensor):
+            return [tensor_like]
+        if isinstance(tensor_like, (list, tuple)):
+            tensors: list[torch.Tensor] = []
+            for item in tensor_like:
+                tensors.extend(self._flatten_tensors(item))
+            return tensors
+        return []
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
         # We assume that attention logit matrices are the main thing that consumes memory

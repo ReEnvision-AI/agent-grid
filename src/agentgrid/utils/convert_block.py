@@ -55,6 +55,14 @@ def convert_block(
         for device in tensor_parallel_devices
     )
 
+    if output_device.type == "mps":
+        attn_impl = getattr(config, "_attn_implementation", None)
+        if attn_impl != "eager":
+            logger.info(
+                "Forcing attention implementation to 'eager' for MPS backend instead of %s", attn_impl
+            )
+            config._attn_implementation = "eager"
+
     if len(tensor_parallel_devices) > 1:
         unique_types = {device.type for device in tensor_parallel_devices}
         if unique_types != {"cuda"}:

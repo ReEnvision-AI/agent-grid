@@ -556,6 +556,27 @@ class MemoryCache:
         # Step 4: Yield tensors
         yield tuple(self._allocated_tensors[handle] for handle in handles)
 
+    def recycle_tensors(self, tensors: Sequence[torch.Tensor]) -> None:
+        """Return temporary tensors back to the free pool for future reuse."""
+        assert os.getpid() == self.runtime_pid
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            if tensor.device.type != "mps":
+                continue
+            descr = TensorDescriptor.from_tensor(tensor)
+            numel = tensor.numel()
+            device_pool = self._free_pools.setdefault(descr.device, {})
+            dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
+            numel_pool = dtype_pool.setdefault(numel, [])
+            numel_pool.append(tensor)
+            dtype_pool.move_to_end(numel)
+            tensor_size = numel * get_size_in_bytes(descr.dtype)
+            with self._pooled_size_bytes.get_lock():
+                self._pooled_size_bytes.value += tensor_size
+
     def _cleanup_expired_preallocations(self):
         """Clean up pre-allocated tensors that have expired due to timeout."""
         current_time = time.time()
