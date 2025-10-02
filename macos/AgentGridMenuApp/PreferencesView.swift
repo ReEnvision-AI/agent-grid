@@ -7,7 +7,15 @@ final class PreferencesViewModel: ObservableObject {
     @Published var envPath: String
     @Published var selectedModel: String
     @Published var warmupInterval: Int
-    @Published var availableModels: [String] = []
+    @Published var device: String
+    @Published var torchDType: String
+    @Published var quantType: String
+    @Published var port: String
+    @Published var identityPath: String
+    @Published var initialPeers: String
+    @Published var newSwarm: Bool
+    @Published var availableModels: [String]
+    @Published var availableDevices: [String] = []
 
     private let configManager: ConfigManager
     private let serverController: ServerProcessController
@@ -16,20 +24,48 @@ final class PreferencesViewModel: ObservableObject {
     init(configManager: ConfigManager, serverController: ServerProcessController) {
         self.configManager = configManager
         self.serverController = serverController
-        pythonPath = UserDefaults.standard.string(forKey: "pythonPath") ?? "/usr/bin/python3"
-        modelsPath = UserDefaults.standard.string(forKey: "modelsPath") ?? "models"
-        envPath = UserDefaults.standard.string(forKey: "envPath") ?? ".env"
-        selectedModel = UserDefaults.standard.string(forKey: "selectedModel") ?? ""
-        warmupInterval = UserDefaults.standard.integer(forKey: "warmupInterval")
+        pythonPath = configManager.currentPythonPath()
+        modelsPath = configManager.currentModelsPath()
+        envPath = configManager.currentEnvPath()
+        selectedModel = configManager.currentSelectedModel()
+        warmupInterval = configManager.currentWarmupInterval()
+        device = configManager.currentDevice()
+        torchDType = configManager.currentTorchDType()
+        quantType = configManager.currentQuantType()
+        port = String(configManager.currentPort())
+        identityPath = configManager.currentIdentityPath()
+        initialPeers = configManager.currentInitialPeers()
+        newSwarm = configManager.currentNewSwarm()
+        availableModels = ConfigManager.defaultModels
+        availableDevices = ["cpu", "mps", "cuda"]
+        if !availableModels.contains(selectedModel) {
+            selectedModel = availableModels.first ?? ""
+        }
 
-        ModelDeviceDiscovery.shared.$models
+        ModelDeviceDiscovery.shared.$devices
             .receive(on: RunLoop.main)
-            .assign(to: &self.$availableModels)
+            .sink { [weak self] devices in
+                guard let self = self else { return }
+                let available = devices
+                    .filter { $0.value.available }
+                    .map { $0.key }
+                self.availableDevices = available.isEmpty ? ["cpu", "mps", "cuda"] : available
+                if !self.availableDevices.contains(self.device) {
+                    self.device = self.availableDevices.first ?? "cpu"
+                }
+            }
+            .store(in: &cancellables)
     }
 
     func refreshModels() {
-        guard let pythonURL = try? configManager.pythonExecutable() else { return }
-        ModelDeviceDiscovery.shared.refreshModels(modelsFile: URL(fileURLWithPath: modelsPath), python: pythonURL)
+        availableModels = ConfigManager.defaultModels
+        if !availableModels.contains(selectedModel) {
+            selectedModel = availableModels.first ?? ""
+        }
+    }
+
+    func refreshDevices() {
+        ModelDeviceDiscovery.shared.refreshDevices()
     }
 
     func save() {
@@ -38,6 +74,13 @@ final class PreferencesViewModel: ObservableObject {
         configManager.update(envPath: envPath)
         configManager.update(warmupInterval: warmupInterval)
         configManager.update(selectedModel: selectedModel)
+        configManager.update(device: device)
+        configManager.update(torchDType: torchDType)
+        configManager.update(quantType: quantType)
+        configManager.update(port: Int(port) ?? 31331)
+        configManager.update(identityPath: identityPath)
+        configManager.update(initialPeers: initialPeers)
+        configManager.update(newSwarm: newSwarm)
     }
 }
 
@@ -52,12 +95,26 @@ struct PreferencesView: View {
                         Text(model).tag(model)
                     }
                 }
-                Button("Refresh Models") {
-                    viewModel.refreshModels()
-                }
+                Button("Refresh Models") { viewModel.refreshModels() }
                 Stepper(value: $viewModel.warmupInterval, in: 0...32768, step: 512) {
                     Text("Warmup tokens interval: \(viewModel.warmupInterval)")
                 }
+            }
+
+            Section(header: Text("Server")) {
+                Picker("Device", selection: $viewModel.device) {
+                    ForEach(viewModel.availableDevices, id: \.self) { device in
+                        Text(device.uppercased()).tag(device)
+                    }
+                }
+                Button("Detect Devices") { viewModel.refreshDevices() }
+                TextField("Torch dtype", text: $viewModel.torchDType)
+                TextField("Quant type", text: $viewModel.quantType)
+                TextField("Port", text: $viewModel.port)
+                TextField("Identity path", text: $viewModel.identityPath)
+                Toggle("Start new swarm", isOn: $viewModel.newSwarm)
+                TextField("Initial peers (comma separated)", text: $viewModel.initialPeers)
+                    .disabled(viewModel.newSwarm)
             }
 
             Section(header: Text("Paths")) {
@@ -74,15 +131,14 @@ struct PreferencesView: View {
             }
         }
         .padding(16)
-        .frame(width: 420)
+        .frame(width: 460)
         .onAppear {
             viewModel.refreshModels()
+            viewModel.refreshDevices()
         }
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
-                Button("Save") {
-                    viewModel.save()
-                }
+                Button("Save") { viewModel.save() }
             }
         }
     }

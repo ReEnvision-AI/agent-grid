@@ -20,8 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
         statusBarController = StatusBarController(serverController: serverController, configManager: configManager)
         serverController.bootstrap()
+        ModelDeviceDiscovery.shared.refreshDevices()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

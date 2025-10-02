@@ -31,25 +31,28 @@ struct ModelSelectionWindow: View {
 
 final class ModelSelectionViewModel: ObservableObject {
     @Published var selectedModel: String
-    @Published var models: [String] = []
+    @Published var models: [String]
 
     private let configManager: ConfigManager
-    private let serverController: ServerProcessController
     private weak var window: NSWindow?
 
-    init(configManager: ConfigManager, serverController: ServerProcessController, window: NSWindow?) {
+    init(configManager: ConfigManager, window: NSWindow?) {
         self.configManager = configManager
-        self.serverController = serverController
         self.window = window
-        self.selectedModel = UserDefaults.standard.string(forKey: "selectedModel") ?? ""
-        ModelDeviceDiscovery.shared.$models
-            .receive(on: RunLoop.main)
-            .assign(to: &self.$models)
+        let defaults = ConfigManager.defaultModels
+        self.models = defaults
+        let current = configManager.currentSelectedModel()
+        if defaults.contains(current) {
+            self.selectedModel = current
+        } else {
+            self.selectedModel = defaults.first ?? ""
+        }
     }
 
     func refreshModels() {
-        if let pythonURL = try? configManager.pythonExecutable() {
-            ModelDeviceDiscovery.shared.refreshModels(modelsFile: configManager.modelsFileURL(), python: pythonURL)
+        models = ConfigManager.defaultModels
+        if !models.contains(selectedModel) {
+            selectedModel = models.first ?? ""
         }
     }
 
@@ -64,16 +67,16 @@ final class ModelSelectionViewModel: ObservableObject {
 }
 
 extension ModelSelectionWindow {
-    static func present(configManager: ConfigManager, serverController: ServerProcessController) {
-        let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 140),
-                             styleMask: [.titled, .closable],
-                             backing: .buffered,
-                             defer: false)
-        window.title = "Select Model"
-        let viewModel = ModelSelectionViewModel(configManager: configManager, serverController: serverController, window: window)
-        window.contentView = NSHostingView(rootView: ModelSelectionWindow(viewModel: viewModel))
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+    static func present(configManager: ConfigManager) {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 140),
+                            styleMask: [.titled, .closable],
+                            backing: .buffered,
+                            defer: false)
+        panel.title = "Select Model"
+        let viewModel = ModelSelectionViewModel(configManager: configManager, window: panel)
+        panel.contentView = NSHostingView(rootView: ModelSelectionWindow(viewModel: viewModel))
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 }

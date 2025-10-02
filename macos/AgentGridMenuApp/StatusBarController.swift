@@ -80,6 +80,10 @@ final class StatusBarController {
     }
 
     @objc private func startServer() {
+        if configManager.currentSelectedModel().isEmpty {
+            ModelSelectionWindow.present(configManager: configManager)
+            return
+        }
         serverController.startServer()
     }
 
@@ -88,7 +92,7 @@ final class StatusBarController {
     }
 
     @objc private func selectModel() {
-        ModelSelectionWindow.present(configManager: configManager, serverController: serverController)
+        ModelSelectionWindow.present(configManager: configManager)
     }
 
     @objc private func openPreferences() {

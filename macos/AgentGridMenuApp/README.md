@@ -26,3 +26,6 @@ After copying these files into your Xcode project, verify the following build se
 - Add the `App Sandbox` entitlement only after deciding on runtime requirements.
 
 The Swift files include TODOs for future work (e.g., wiring Keychain storage) and provide placeholder Combine publishers to feed the UI.
+
+## Menu Bar Only Setup
+- In the app target's Info "Custom macOS Application Property" add `Application is agent (UIElement)` (key `LSUIElement`) and set it to `YES` so the app stays in the menu bar without a dock icon.
