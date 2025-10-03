@@ -1,4 +1,4 @@
-const { app, Menu, Tray, dialog, BrowserWindow, ipcMain, shell, nativeImage } = require('electron');
+const { app, Menu, Tray, dialog, BrowserWindow, ipcMain, shell, nativeImage, powerSaveBlocker } = require('electron');
 
 // Quit if not on Apple Silicon, which is required for the bundled Python runtime.
 if (process.platform === 'darwin' && process.arch !== 'arm64') {
@@ -44,10 +44,32 @@ let serverState = 'stopped';
 let runtimeState = 'pending';
 let runtimeErrorMessage = null;
 let runtimeMetadata = null;
+let powerSaveBlockerId = null;
 
 function createTray() {
   updateTrayIcon();
   buildTrayMenu();
+}
+
+function preventSleep() {
+  if (!powerSaveBlockerId) {
+    powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+    log.info('[sleep] 🛡️ Sleep prevention ENABLED - System will stay awake while server is running');
+    log.info('[sleep] 💡 Note: Your Mac will not sleep automatically while Agent Grid server is active');
+  } else {
+    log.info('[sleep] ℹ️ Sleep prevention already active');
+  }
+}
+
+function allowSleep() {
+  if (powerSaveBlockerId) {
+    powerSaveBlocker.stop(powerSaveBlockerId);
+    powerSaveBlockerId = null;
+    log.info('[sleep] 😴 Sleep prevention DISABLED - System can now sleep normally');
+    log.info('[sleep] 💤 Your Mac will resume normal sleep behavior');
+  } else {
+    log.info('[sleep] ℹ️ Sleep prevention already disabled');
+  }
 }
 
 function updateTrayIcon() {
@@ -89,22 +111,38 @@ function updateTrayIcon() {
     tray.setImage(icon);
   } else {
     tray = new Tray(icon);
-    tray.setToolTip('Agent Grid');
   }
+
+  // Update tooltip based on server state and sleep prevention
+  const tooltip = serverState === 'running' && powerSaveBlockerId
+    ? 'Agent Grid - Server Running (Sleep Prevention Active)'
+    : 'Agent Grid';
+  tray.setToolTip(tooltip);
 }
 
 function buildTrayMenu() {
-  const menu = Menu.buildFromTemplate([
+  const menuItems = [
     { label: stateLabel(), enabled: false },
     { type: 'separator' },
     { label: 'Start Server…', click: startServer, enabled: runtimeState === 'ready' && serverState === 'stopped' },
     { label: 'Stop Server', click: stopServer, enabled: serverState === 'running' || serverState === 'starting' },
-    { type: 'separator' },
+    { type: 'separator' }
+  ];
+
+  // Add sleep prevention indicator when server is running
+  if (serverState === 'running' && powerSaveBlockerId) {
+    menuItems.push({ label: '☁️ Sleep Prevention Active', enabled: false });
+    menuItems.push({ type: 'separator' });
+  }
+
+  menuItems.push(
     { label: 'Preferences…', click: showPreferences },
     { label: 'View Logs', click: openLogs },
     { type: 'separator' },
     { label: 'Quit Agent Grid', click: quitApp }
-  ]);
+  );
+
+  const menu = Menu.buildFromTemplate(menuItems);
   tray.setContextMenu(menu);
 }
 
@@ -229,13 +267,18 @@ function startServer() {
     serverProcess.on('exit', (code) => {
       serverProcess = null;
       serverState = code === 0 ? 'stopped' : 'failed';
+      const stateText = code === 0 ? 'stopped' : 'failed';
+      log.info(`[server] 🛑 Server has ${stateText} - disabling sleep prevention`);
+      allowSleep();
       updateTrayIcon();
       buildTrayMenu();
     });
   } catch (error) {
     serverProcess = null;
     serverState = 'failed';
+    log.error('[server] ❌ Server failed to start - disabling sleep prevention', error);
     dialog.showErrorBox('Failed to start server', String(error));
+    allowSleep();
     updateTrayIcon();
     buildTrayMenu();
   }
@@ -244,6 +287,8 @@ function startServer() {
 function stopServer() {
   if (!serverProcess || !serverProcess.pid) {
     serverState = 'stopped';
+    log.info('[server] ⏹️ Server already stopped - ensuring sleep prevention is disabled');
+    allowSleep();
     updateTrayIcon();
     buildTrayMenu();
     return;
@@ -380,8 +425,10 @@ function ensureLogDirectory() {
 function handleStdout(data) {
   const text = data.toString();
   log.info(text.trim());
-  if (text.includes('Running a server on')) {
+  if (text.includes('Running a server on') || text.includes('Started')) {
     serverState = 'running';
+    log.info('[server] 🚀 Server is now running - enabling sleep prevention');
+    preventSleep();
     updateTrayIcon();
     buildTrayMenu();
   }
@@ -392,13 +439,32 @@ function handleStdout(data) {
 
 function handleStderr(data) {
   const text = data.toString();
-  log.error(text.trim());
+
+  // Check if this is an INFO message (not actually an error)
+  if (text.includes('[INFO]')) {
+    log.info(text.trim()); // Log as info instead of error
+
+    // Check for server start message
+    if (text.includes('Started')) {
+      serverState = 'running';
+      log.info('[server] 🚀 Server is now running (detected from stderr) - enabling sleep prevention');
+      preventSleep();
+      updateTrayIcon();
+      buildTrayMenu();
+    }
+  } else {
+    log.error(text.trim()); // Log actual errors as errors
+  }
+
   if (preferencesWindow) {
     preferencesWindow.webContents.send('log-update', { stream: 'stderr', message: text });
   }
 }
 
 app.whenReady().then(async () => {
+  log.info('[app] 🚀 Agent Grid is starting up...');
+  log.info('[sleep] 💤 Sleep prevention system initialized - will activate when server starts');
+
   try {
     await initStore();
   } catch (error) {
@@ -498,8 +564,13 @@ app.on('window-all-closed', (event) => {
 });
 
 app.on('before-quit', (event) => {
+  // Always clean up power save blocker on quit
+  log.info('[app] 🏠 Application quitting - cleaning up sleep prevention');
+  allowSleep();
+
   if (serverState === 'stopped' || !serverProcess) {
     // Server is not running, quit immediately.
+    log.info('[app] 👋 Goodbye! Agent Grid is shutting down.');
     return;
   }
 
