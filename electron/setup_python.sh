@@ -1,90 +1,112 @@
 #!/bin/bash
-set -e # Exit immediately if a command exits with a non-zero status.
+
+set -euo pipefail
 
 echo "--- Setting up Python runtime for Electron app ---"
 
-# --- 1. Define constants and detect environment ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 PYTHON_VERSION="3.11.9"
 RELEASE_TAG="20240415"
 BASE_URL="https://github.com/indygreg/python-build-standalone/releases/download/${RELEASE_TAG}"
 
-TARGET_DIR="electron/python-runtime"
-OS=$(uname -s)
-ARCH=$(uname -m)
+OS="$(uname -s)"
+ARCH="$(uname -m)"
 
-PYTHON_DIST=""
-# Default to the 'macos' extra, which pulls in 'inference' dependencies.
-# This is suitable for cross-platform CPU-based execution.
 INSTALL_EXTRA="macos"
+PLATFORM_KEY=""
+PYTHON_DIST=""
 
-case "$OS" in
-    Darwin)
-        case "$ARCH" in
-            arm64)
-                PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-aarch64-apple-darwin-install_only.tar.gz"
-                ;;
-            x86_64)
-                PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-x86_64-apple-darwin-install_only.tar.gz"
-                ;;
-        esac
+case "${OS}" in
+  Darwin)
+    case "${ARCH}" in
+      arm64)
+        PLATFORM_KEY="darwin-arm64"
+        PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-aarch64-apple-darwin-install_only.tar.gz"
         ;;
-    Linux)
-        case "$ARCH" in
-            x86_64)
-                PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
-                # For Linux, we can use the 'full' install to get GPU support if available.
-                INSTALL_EXTRA="full"
-                ;;
-            # Add other Linux architectures if needed, e.g., aarch64
-        esac
+      x86_64)
+        PLATFORM_KEY="darwin-x64"
+        PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-x86_64-apple-darwin-install_only.tar.gz"
         ;;
-    # Add Windows (e.g., MINGW64_NT*) support here if needed in the future.
+    esac
+    ;;
+  Linux)
+    case "${ARCH}" in
+      x86_64)
+        PLATFORM_KEY="linux-x64"
+        PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+        INSTALL_EXTRA="full"
+        ;;
+      arm64|aarch64)
+        PLATFORM_KEY="linux-arm64"
+        PYTHON_DIST="cpython-${PYTHON_VERSION}+${RELEASE_TAG}-aarch64-unknown-linux-gnu-install_only.tar.gz"
+        INSTALL_EXTRA="full"
+        ;;
+    esac
+    ;;
 esac
 
-if [ -z "$PYTHON_DIST" ]; then
-    echo "Error: Unsupported OS/Architecture: $OS/$ARCH"
-    exit 1
+if [[ -z "${PYTHON_DIST}" || -z "${PLATFORM_KEY}" ]]; then
+  echo "Error: Unsupported OS/Architecture combination: ${OS}/${ARCH}" >&2
+  exit 1
 fi
 
 DOWNLOAD_URL="${BASE_URL}/${PYTHON_DIST}"
-INSTALL_CMD="pip install .[${INSTALL_EXTRA}]"
+TARGET_ROOT="${PROJECT_ROOT}/electron/python-runtime/${PLATFORM_KEY}"
+PYTHON_DIR="${TARGET_ROOT}"
+VENV_PATH="${TARGET_ROOT}/venv"
+PIP_INSTALL_SPEC=".[${INSTALL_EXTRA}]"
 
-# --- 2. Clean and create target directory ---
-echo "Preparing target directory: $TARGET_DIR"
-if [ -d "$TARGET_DIR" ]; then
-    echo "Removing existing runtime directory to ensure a clean setup."
-    rm -rf "$TARGET_DIR"
+echo "Preparing target directory: ${TARGET_ROOT}"
+rm -rf "${TARGET_ROOT}"
+mkdir -p "${TARGET_ROOT}"
+
+TEMP_TARBALL="$(mktemp)"
+cleanup() {
+  rm -f "${TEMP_TARBALL}"
+}
+trap cleanup EXIT
+echo "Downloading Python ${PYTHON_VERSION} runtime from:"
+echo "  ${DOWNLOAD_URL}"
+curl -fL -o "${TEMP_TARBALL}" "${DOWNLOAD_URL}"
+
+echo "Extracting runtime..."
+tar -xzf "${TEMP_TARBALL}" --strip-components=1 -C "${TARGET_ROOT}"
+
+if [[ ! -x "${PYTHON_DIR}/bin/python3" ]]; then
+  echo "Error: Extracted runtime missing python executable at ${PYTHON_DIR}/bin/python3" >&2
+  exit 1
 fi
-mkdir -p "$TARGET_DIR"
 
-# --- 3. Download and extract Python ---
-TEMP_FILE=$(mktemp)
-echo "Downloading Python distribution for $OS $ARCH..."
-echo "URL: $DOWNLOAD_URL"
-curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"
+echo "Creating bundled virtual environment at ${VENV_PATH}"
+rm -rf "${VENV_PATH}"
+"${PYTHON_DIR}/bin/python3" -m venv "${VENV_PATH}"
 
-echo "Extracting Python to $TARGET_DIR..."
-# The archive extracts its content into a 'python' directory.
-tar -xzf "$TEMP_FILE" -C "$TARGET_DIR"
-# Move the contents from the nested 'python' directory to our target directory.
-mv "$TARGET_DIR"/python/* "$TARGET_DIR"/
-rmdir "$TARGET_DIR"/python
+VENV_PYTHON="${VENV_PATH}/bin/python3"
+VENV_PIP="${VENV_PATH}/bin/pip"
 
-# --- 4. Install agent-grid and dependencies ---
-PIP_PATH="$TARGET_DIR/bin/pip"
-echo "Using pip at $PIP_PATH to install project dependencies..."
-echo "Running command: $INSTALL_CMD (from project root)"
+echo "Upgrading seed tools inside virtual environment..."
+"${VENV_PIP}" install --upgrade pip setuptools wheel
 
-# It's good practice to upgrade pip first.
-"$PIP_PATH" install --upgrade pip
+echo "Installing Agent Grid (${PIP_INSTALL_SPEC}) into bundled venv..."
+(
+  cd "${PROJECT_ROOT}"
+  "${VENV_PIP}" install --no-cache-dir "${PIP_INSTALL_SPEC}"
+)
 
-# Execute the installation. This assumes the script is run from the project root.
-"$PIP_PATH" install ".[${INSTALL_EXTRA}]"
+ARCHIVE_PATH="${TARGET_ROOT}.tar.gz"
+echo "Creating compressed runtime archive at ${ARCHIVE_PATH}"
+tar -czf "${ARCHIVE_PATH}" -C "${TARGET_ROOT}" .
 
-# --- 5. Cleanup ---
-echo "Cleaning up temporary download file..."
-rm "$TEMP_FILE"
+if [[ "${KEEP_UNPACKED_RUNTIME:-0}" != "1" ]]; then
+  echo "Removing unpacked runtime directory (set KEEP_UNPACKED_RUNTIME=1 to keep it)."
+  rm -rf "${TARGET_ROOT}"
+fi
 
 echo ""
-echo "--- Python runtime setup complete! ---"
-echo "Environment created at: $TARGET_DIR"
+echo "--- Python runtime setup complete ---"
+if [[ -d "${TARGET_ROOT}" ]]; then
+  echo "Bundled environment created at: ${TARGET_ROOT}"
+fi
+echo "Runtime archive available at: ${ARCHIVE_PATH}"

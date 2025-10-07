@@ -356,6 +356,7 @@ function writeRuntimeConfig(settings) {
     token: process.env.HF_TOKEN || null,
     warmup_tokens_interval: settings.warmupTokensInterval || 0,
     quant_type: settings.quantType || 'none',
+    attn_cache_tokens: 128000,
     dht_prefix: normalizeDhtPrefix(settings.dhtPrefix),
     throughput: normalizeThroughput(settings.throughput)
   };
@@ -414,6 +415,7 @@ function buildEnvironment(settings) {
   const env = { ...process.env };
   env.AGENTGRID_ENV_PATH = path.resolve(settings.envPath || '.env');
   env.AGENTGRID_MODELS_FILE = path.resolve(settings.modelsPath || 'models');
+  env.ATTN_CACHE_TOKENS = '128000';
   return env;
 }
 

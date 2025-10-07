@@ -6,8 +6,8 @@ const { spawn } = require('child_process');
 
 const MIN_PYTHON_MAJOR = 3;
 const MIN_PYTHON_MINOR = 11;
-const METADATA_VERSION = 2;
-const BUNDLED_PYTHON_DIR = 'python';
+const METADATA_VERSION = 3;
+const BUNDLED_PYTHON_DIRS = ['python', 'python-runtime'];
 
 function runCommand(command, args, { cwd, env, log } = {}) {
   return new Promise((resolve, reject) => {
@@ -89,58 +89,155 @@ function computeFileDigest(filePath) {
   }
 }
 
+function getArchiveFormat(archivePath) {
+  if (archivePath.endsWith('.tar.gz') || archivePath.endsWith('.tgz')) {
+    return 'tar.gz';
+  }
+  if (archivePath.endsWith('.zip')) {
+    return 'zip';
+  }
+  if (archivePath.endsWith('.tar')) {
+    return 'tar';
+  }
+  return 'unknown';
+}
+
+function findBundledArchive(candidateRoot, platformKey) {
+  const names = [
+    `${platformKey}.tar.gz`,
+    `${platformKey}.tgz`,
+    `${platformKey}.tar`,
+    `${platformKey}.zip`
+  ];
+  for (const name of names) {
+    const fullPath = path.join(candidateRoot, name);
+    if (fs.existsSync(fullPath)) {
+      return fullPath;
+    }
+  }
+  // fallback: scan directory for archive starting with platform key
+  try {
+    const entries = fs.readdirSync(candidateRoot);
+    for (const entry of entries) {
+      if (!entry.startsWith(platformKey)) {
+        continue;
+      }
+      const ext = getArchiveFormat(entry);
+      if (ext === 'unknown') {
+        continue;
+      }
+      const fullPath = path.join(candidateRoot, entry);
+      if (fs.existsSync(fullPath)) {
+        return fullPath;
+      }
+    }
+  } catch (error) {
+    // ignore
+  }
+  return null;
+}
+
 function resolveBundledPython(log) {
   const platformKey = getPlatformKey();
-  const candidates = [];
+  const baseCandidates = [];
 
   const resourcesPath = process.resourcesPath;
   if (resourcesPath) {
-    candidates.push(path.join(resourcesPath, BUNDLED_PYTHON_DIR, platformKey));
+    for (const dir of BUNDLED_PYTHON_DIRS) {
+      baseCandidates.push(path.join(resourcesPath, dir));
+    }
   }
 
   const projectRoot = path.resolve(__dirname, '..', '..');
-  candidates.push(path.join(projectRoot, 'electron', 'python-runtime', platformKey));
-  candidates.push(path.join(projectRoot, 'python-runtime', platformKey));
+  for (const dir of ['electron/python-runtime', 'python-runtime', 'python']) {
+    baseCandidates.push(path.join(projectRoot, dir));
+  }
 
-  for (const candidate of candidates) {
-    const prebuiltVenvPath = path.join(candidate, 'venv');
-    if (fs.existsSync(prebuiltVenvPath)) {
+  for (const base of baseCandidates) {
+    const platformDir = path.join(base, platformKey);
+    log?.info(`[runtime] Probing bundled runtime directory: ${platformDir}`);
+    if (fs.existsSync(platformDir) && fs.statSync(platformDir).isDirectory()) {
+      const prebuiltVenvPath = path.join(platformDir, 'venv');
       const venvPython = resolveVenvPython(prebuiltVenvPath);
       if (venvPython) {
         const signature = computeFileDigest(path.join(prebuiltVenvPath, 'pyvenv.cfg'));
         log?.info(`[runtime] Using bundled prebuilt Python venv from ${prebuiltVenvPath}`);
         return {
-          root: candidate,
+          root: platformDir,
           pythonPath: venvPython,
           prebuiltVenv: true,
           prebuiltVenvPath,
-          prebuiltSignature: signature
+          prebuiltSignature: signature,
+          archivePath: null,
+          archiveFormat: null
+        };
+      }
+
+      const pythonPath = resolveVenvPython(platformDir);
+      if (pythonPath) {
+        log?.info(`[runtime] Using bundled Python runtime from ${platformDir}`);
+        return {
+          root: platformDir,
+          pythonPath,
+          prebuiltVenv: false,
+          prebuiltVenvPath: null,
+          prebuiltSignature: null,
+          archivePath: null,
+          archiveFormat: null
         };
       }
     }
 
-    const pythonPath = resolveVenvPython(candidate);
-    if (pythonPath) {
-      log?.info(`[runtime] Using bundled Python runtime from ${candidate}`);
-      return { root: candidate, pythonPath, prebuiltVenv: false };
+    const archivePath = findBundledArchive(base, platformKey);
+    if (archivePath) {
+      const signature = computeFileDigest(archivePath);
+      log?.info(`[runtime] Found bundled runtime archive at ${archivePath}`);
+      return {
+        root: base,
+        pythonPath: null,
+        prebuiltVenv: false,
+        prebuiltVenvPath: null,
+        prebuiltSignature: signature,
+        archivePath,
+        archiveFormat: getArchiveFormat(archivePath)
+      };
     }
   }
 
+  if (resourcesPath) {
+    try {
+      const entries = fs.readdirSync(resourcesPath);
+      log?.warn(`[runtime] Available entries under resourcesPath (${resourcesPath}): ${entries.join(', ')}`);
+    } catch (error) {
+      log?.warn(`[runtime] Failed listing resourcesPath ${resourcesPath}: ${error}`);
+    }
+  }
   return null;
 }
 
 async function findBootstrapPython(log) {
   const bundled = resolveBundledPython(log);
   if (bundled) {
-    const { stdout: versionOut } = await runCommand(bundled.pythonPath, ['-c', 'import platform; print(platform.python_version())']);
+    let pythonVersion = null;
+    if (bundled.pythonPath) {
+      try {
+        const { stdout: versionOut } = await runCommand(bundled.pythonPath, ['-c', 'import platform; print(platform.python_version())']);
+        pythonVersion = versionOut.trim();
+      } catch (error) {
+        log?.warn(`[runtime] Unable to determine version of bundled interpreter: ${error}`);
+        pythonVersion = null;
+      }
+    }
     return {
-      executable: bundled.pythonPath,
-      version: versionOut.trim(),
+      executable: bundled.pythonPath || null,
+      version: pythonVersion,
       bundled: true,
       bundledRoot: bundled.root,
       prebuiltVenv: Boolean(bundled.prebuiltVenv),
       prebuiltVenvPath: bundled.prebuiltVenvPath || null,
-      prebuiltSignature: bundled.prebuiltSignature || null
+      prebuiltSignature: bundled.prebuiltSignature || null,
+      archivePath: bundled.archivePath || null,
+      archiveFormat: bundled.archiveFormat || null
     };
   }
   const candidates = [];
@@ -239,24 +336,6 @@ function writeMetadata(metadataPath, metadata) {
   fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
 }
 
-async function installDependencies(pythonExecutable, projectRoot, extras, log) {
-  const pipEnv = {
-    PIP_DISABLE_PIP_VERSION_CHECK: '1',
-    PYTHONWARNINGS: 'ignore'
-  };
-  await runCommand(pythonExecutable, ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], {
-    env: pipEnv,
-    log
-  });
-
-  const spec = extras ? `.[${extras}]` : '.';
-  await runCommand(pythonExecutable, ['-m', 'pip', 'install', spec], {
-    cwd: projectRoot,
-    env: pipEnv,
-    log
-  });
-}
-
 function runtimeMetadataUpToDate({ metadata, venvPath, extras, agentGridVersion, expectedPrebuiltSignature }, log) {
   if (!metadata) {
     return false;
@@ -265,18 +344,17 @@ function runtimeMetadataUpToDate({ metadata, venvPath, extras, agentGridVersion,
     log?.info('[runtime] Metadata version mismatch; reinstall required');
     return false;
   }
-  if (metadata.installMethod === 'prebuilt') {
-    if (!expectedPrebuiltSignature || metadata.prebuiltVenvSignature !== expectedPrebuiltSignature) {
-      log?.info('[runtime] Bundled venv signature changed; reinstall required');
-      return false;
-    }
-  } else {
-    if (metadata.extras !== extras) {
-      log?.info('[runtime] Extras selection changed; reinstall required');
-      return false;
-    }
-    if (agentGridVersion && metadata.agentGridVersion !== agentGridVersion) {
-      log?.info('[runtime] Agent Grid version changed; reinstall required');
+  if (metadata.extras !== extras) {
+    log?.info('[runtime] Extras selection changed; reinstall required');
+    return false;
+  }
+  if (agentGridVersion && metadata.agentGridVersion !== agentGridVersion) {
+    log?.info('[runtime] Agent Grid version changed; reinstall required');
+    return false;
+  }
+  if (metadata.installMethod === 'prebuilt' || metadata.installMethod === 'prebuilt-archive') {
+    if (!expectedPrebuiltSignature || metadata.prebuiltSignature !== expectedPrebuiltSignature) {
+      log?.info('[runtime] Bundled runtime signature changed; reinstall required');
       return false;
     }
   }
@@ -298,6 +376,150 @@ function copyDirectory(src, dest) {
   fs.cpSync(src, dest, { recursive: true });
 }
 
+function rewritePyvenvCfg(venvPath, baseDir, basePython, versionedPython, log) {
+  const cfgPath = path.join(venvPath, 'pyvenv.cfg');
+  if (!fs.existsSync(cfgPath)) {
+    log?.warn(`[runtime] pyvenv.cfg missing at ${cfgPath}`);
+    return;
+  }
+  try {
+    const replacements = {
+      home: baseDir,
+      executable: versionedPython || basePython,
+      command: `${basePython} -m venv ${venvPath}`
+    };
+    const lines = fs.readFileSync(cfgPath, 'utf8').split(/\r?\n/);
+    const updated = lines.map((line) => {
+      const [key, ...rest] = line.split('=');
+      if (!key || rest.length === 0) {
+        return line;
+      }
+      const normalizedKey = key.trim();
+      if (replacements[normalizedKey]) {
+        return `${normalizedKey} = ${replacements[normalizedKey]}`;
+      }
+      return line;
+    });
+    fs.writeFileSync(cfgPath, `${updated.join('\n')}\n`);
+  } catch (error) {
+    log?.warn(`[runtime] Failed to rewrite pyvenv.cfg at ${cfgPath}: ${error}`);
+  }
+}
+
+function rewriteVenvShebangs(binDir, pythonPath, log) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(binDir, { withFileTypes: true });
+  } catch (error) {
+    log?.warn(`[runtime] Failed listing ${binDir} for shebang rewrite: ${error}`);
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const fullPath = path.join(binDir, entry.name);
+    try {
+      const content = fs.readFileSync(fullPath);
+      if (content.length < 2 || content[0] !== 0x23 || content[1] !== 0x21) {
+        continue;
+      }
+      const text = content.toString('utf8');
+      const newlineIndex = text.indexOf('\n');
+      if (newlineIndex === -1) {
+        continue;
+      }
+      const shebang = text.slice(0, newlineIndex);
+      const rest = text.slice(newlineIndex + 1);
+      const desiredShebang = `#!${pythonPath}`;
+      if (shebang === desiredShebang) {
+        continue;
+      }
+      fs.writeFileSync(fullPath, `${desiredShebang}\n${rest}`);
+    } catch (error) {
+      log?.warn(`[runtime] Failed rewriting shebang for ${fullPath}: ${error}`);
+    }
+  }
+}
+
+function relocateBundledVenv(runtimeRoot, log) {
+  const venvPath = path.join(runtimeRoot, 'venv');
+  const binDir = path.join(venvPath, 'bin');
+  const baseDir = path.join(runtimeRoot, 'bin');
+  if (!fs.existsSync(venvPath)) {
+    throw new Error(`Bundled runtime is missing virtual environment at ${venvPath}`);
+  }
+  if (!fs.existsSync(baseDir)) {
+    throw new Error(`Bundled runtime is missing base interpreter directory at ${baseDir}`);
+  }
+  let basePython = path.join(baseDir, 'python3');
+  if (!fs.existsSync(basePython)) {
+    basePython = path.join(baseDir, 'python');
+  }
+  if (!fs.existsSync(basePython)) {
+    throw new Error(`Bundled runtime is missing python executable in ${baseDir}`);
+  }
+  let versionedPython = null;
+  try {
+    for (const entry of fs.readdirSync(baseDir)) {
+      if (/^python3\.\d+$/.test(entry)) {
+        versionedPython = path.join(baseDir, entry);
+        break;
+      }
+    }
+  } catch (error) {
+    log?.warn(`[runtime] Failed scanning ${baseDir} for versioned interpreter: ${error}`);
+  }
+
+  const linkSpecs = [
+    { name: 'python', target: basePython },
+    { name: 'python3', target: basePython }
+  ];
+  if (versionedPython) {
+    linkSpecs.push({ name: path.basename(versionedPython), target: versionedPython });
+  }
+
+  for (const { name, target } of linkSpecs) {
+    const dest = path.join(binDir, name);
+    try {
+      fs.rmSync(dest, { force: true });
+      if (process.platform === 'win32') {
+        fs.copyFileSync(target, dest);
+      } else {
+        fs.symlinkSync(target, dest);
+      }
+    } catch (error) {
+      log?.warn(`[runtime] Failed updating symlink ${dest} -> ${target}: ${error}`);
+    }
+  }
+
+  rewritePyvenvCfg(venvPath, baseDir, basePython, versionedPython, log);
+  const venvPython = path.join(binDir, 'python3');
+  rewriteVenvShebangs(binDir, venvPython, log);
+  return venvPython;
+}
+
+async function extractBundledArchive(archivePath, destinationDir, log) {
+  const format = getArchiveFormat(archivePath);
+  if (format === 'unknown') {
+    throw new Error(`Unsupported runtime archive format for ${archivePath}`);
+  }
+
+  fs.rmSync(destinationDir, { recursive: true, force: true });
+  fs.mkdirSync(destinationDir, { recursive: true });
+
+  log?.info(`[runtime] Extracting bundled runtime archive (${format}) to ${destinationDir}`);
+  if (format === 'tar.gz' || format === 'tgz') {
+    await runCommand('tar', ['-xzf', archivePath, '-C', destinationDir], { log });
+  } else if (format === 'tar') {
+    await runCommand('tar', ['-xf', archivePath, '-C', destinationDir], { log });
+  } else if (format === 'zip') {
+    await runCommand('unzip', ['-oq', archivePath, '-d', destinationDir], { log });
+  } else {
+    throw new Error(`Unsupported runtime archive format "${format}" for ${archivePath}`);
+  }
+}
+
 async function ensurePythonRuntime({ app, log, store, projectRoot }) {
   const runtimeRoot = path.join(app.getPath('userData'), 'python-runtime');
   const metadataPath = path.join(runtimeRoot, 'runtime.json');
@@ -315,49 +537,19 @@ async function ensurePythonRuntime({ app, log, store, projectRoot }) {
     return metadata;
   }
 
-  const { executable, version } = bootstrap;
   fs.mkdirSync(runtimeRoot, { recursive: true });
 
   let runtimeMetadata;
 
   if (bootstrap.bundled && bootstrap.prebuiltVenv && bootstrap.prebuiltVenvPath) {
     log?.info('[runtime] Installing bundled virtual environment');
-    copyDirectory(bootstrap.prebuiltVenvPath, venvPath);
-    const venvPython = resolveVenvPython(venvPath);
-    if (!venvPython) {
-      throw new Error('Bundled virtual environment is missing its Python executable.');
+    if (!bootstrap.bundledRoot) {
+      throw new Error('Bundled runtime missing root directory reference.');
     }
-    runtimeMetadata = {
-      version: METADATA_VERSION,
-      pythonPath: venvPython,
-      pythonVersion: version,
-      agentGridVersion: agentGridVersion || null,
-      extras,
-      createdAt: new Date().toISOString(),
-      basePython: executable,
-      basePythonVersion: version,
-      platform: `${process.platform}-${os.arch()}`,
-      bundled: true,
-      bundledRoot: bootstrap.bundledRoot || null,
-      installMethod: 'prebuilt',
-      prebuiltVenvSignature: bootstrap.prebuiltSignature || null
-    };
-  } else {
-    log?.info(`[runtime] Creating virtual environment at ${venvPath}`);
-    fs.rmSync(venvPath, { recursive: true, force: true });
-
-    await runCommand(executable, ['-m', 'venv', venvPath], { log });
-
-    const venvPython = resolveVenvPython(venvPath);
-    if (!venvPython) {
-      throw new Error('Failed to locate Python executable inside virtual environment.');
-    }
-
-    await installDependencies(venvPython, projectRoot, extras, log);
-
+    copyDirectory(bootstrap.bundledRoot, runtimeRoot);
+    const venvPython = relocateBundledVenv(runtimeRoot, log);
     const installedVersionOutput = await runCommand(venvPython, ['-c', 'import platform; print(platform.python_version())']);
     const venvVersion = installedVersionOutput.stdout.trim();
-
     runtimeMetadata = {
       version: METADATA_VERSION,
       pythonPath: venvPython,
@@ -365,14 +557,39 @@ async function ensurePythonRuntime({ app, log, store, projectRoot }) {
       agentGridVersion: agentGridVersion || null,
       extras,
       createdAt: new Date().toISOString(),
-      basePython: executable,
-      basePythonVersion: version,
+      basePython: venvPython,
+      basePythonVersion: venvVersion,
       platform: `${process.platform}-${os.arch()}`,
-      bundled: Boolean(bootstrap.bundled),
+      bundled: true,
       bundledRoot: bootstrap.bundledRoot || null,
-      installMethod: 'pip',
-      prebuiltVenvSignature: null
+      installMethod: 'prebuilt',
+      prebuiltSignature: bootstrap.prebuiltSignature || null,
+      archiveFormat: null
     };
+  } else if (bootstrap.bundled && bootstrap.archivePath) {
+    log?.info('[runtime] Extracting bundled runtime archive');
+    await extractBundledArchive(bootstrap.archivePath, runtimeRoot, log);
+    const venvPython = relocateBundledVenv(runtimeRoot, log);
+    const installedVersionOutput = await runCommand(venvPython, ['-c', 'import platform; print(platform.python_version())']);
+    const venvVersion = installedVersionOutput.stdout.trim();
+    runtimeMetadata = {
+      version: METADATA_VERSION,
+      pythonPath: venvPython,
+      pythonVersion: venvVersion,
+      agentGridVersion: agentGridVersion || null,
+      extras,
+      createdAt: new Date().toISOString(),
+      basePython: venvPython,
+      basePythonVersion: venvVersion,
+      platform: `${process.platform}-${os.arch()}`,
+      bundled: true,
+      bundledRoot: bootstrap.bundledRoot || null,
+      installMethod: 'prebuilt-archive',
+      prebuiltSignature: bootstrap.prebuiltSignature || null,
+      archiveFormat: bootstrap.archiveFormat || null
+    };
+  } else {
+    throw new Error('Bundled Python runtime is missing. Re-run setup_python.sh to generate it before packaging the app.');
   }
 
   writeMetadata(metadataPath, runtimeMetadata);

@@ -33,10 +33,16 @@ Before you can run or package the app, you must generate the Python runtime. Fro
 This script will:
 1.  Detect your operating system and architecture.
 2.  Download a standalone Python 3.11 environment.
-3.  Extract it into the `electron/python-runtime` directory.
-4.  Install the `agent-grid` library and all necessary dependencies (`[macos]` or `[full]`) into that environment.
+3.  Extract it into the `electron/python-runtime/<platform>` directory (for example `darwin-arm64`).
+4.  Create a pre-baked virtual environment with the required `agent-grid` dependencies (`[macos]` or `[full]`).
+
+On first launch, the Electron app simply copies this bundled virtual environment into the user data directory, so it no longer needs to build a Python runtime or download packages on the target machine. If the bundle is missing, the app will refuse to start—always regenerate it before packaging. The `electron/package.json` build config copies everything under `python-runtime/` into the app bundle’s `Contents/Resources/python-runtime/` directory, so make sure that tree exists before running `npm run dist`.
+
+If you previously launched an older build, delete `~/Library/Application Support/agent-grid-electron/python-runtime` before running the refreshed app so it can copy the updated runtime bundle.
 
 The `electron/python-runtime` directory is ignored by Git. If you make changes to the Python source code in `src/agentgrid` or change dependencies in `pyproject.toml`, you should re-run the script to generate a fresh environment.
+
+> **Note:** The setup script now emits a compressed archive (`python-runtime/<platform>.tar.gz`). The Electron app extracts this archive into the user’s data directory the first time it runs. Set `KEEP_UNPACKED_RUNTIME=1` when invoking `./electron/setup_python.sh` if you also want to keep the unpacked runtime directory around for local debugging.
 
 The preferences window still allows pointing to an alternate interpreter when debugging or developing against a custom virtual environment.
 
