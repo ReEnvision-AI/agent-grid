@@ -1,11 +1,14 @@
-"""
-A copy of run_dht.py from hivemind with the ReachabilityProtocol added:
-https://github.com/learning-at-home/hivemind/blob/master/hivemind/hivemind_cli/run_dht.py
+#
+# Copyright (c) 2025 ReEnvision AI, LLC. All rights reserved.
+#
+# This software is the confidential and proprietary information of
+# ReEnvision AI, LLC ("Confidential Information"). You shall not
+# disclose such Confidential Information and shall use it only in
+# accordance with the terms of the license agreement you entered into
+# with ReEnvision AI, LLC.
+#
 
-This script may be used for launching lightweight CPU machines serving as bootstrap nodes to a Agent Grid swarm.
 
-This may be eventually merged to the hivemind upstream.
-"""
 
 import argparse
 import time
