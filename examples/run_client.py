@@ -11,6 +11,7 @@ MODELS = [
     "Qwen/Qwen2.5-Coder-32B-Instruct",
     "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
     "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+    "unsloth/gpt-oss-20b-BF16"
 ]
 
 
@@ -37,7 +38,6 @@ def generate(model_id: str) -> None:
         model_name_or_path=model_id,
         torch_dtype=torch.bfloat16,
         initial_peers=["/ip4/127.0.0.1/tcp/31331/p2p/Qmbnu3pqyWvXaehb5si5mpyeVQh7RZMPcrrWBX2gnWcc3D"],
-        attn_implementation="flash_attention_2",
     ).to("cuda")
 
     # Load the tokenizer
@@ -45,7 +45,7 @@ def generate(model_id: str) -> None:
 
     # Get the messages from the user
     user_prompt = input("User prompt: ")
-    messages = [{"role": "system", "content": "You are a very helpful assistant. detailed thinking off /no_think"}, {"role": "user", "content": user_prompt}]
+    messages = [{"role": "system", "content": "You are a very helpful assistant. /no_think"}, {"role": "user", "content": user_prompt}]
 
     inputs = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True
@@ -55,14 +55,24 @@ def generate(model_id: str) -> None:
 
     with torch.inference_mode():
         start_time = time.perf_counter()
-        response = model.generate(inputs["input_ids"], attention_mask=inputs["attention_mask"], max_new_tokens=512)
+        response = model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id
+        )
         end_time = time.perf_counter()
 
+    print(f"The number of responses: {len(response)}")
     n_outputs = len(response[0, n_inputs:])
     total_time = end_time-start_time
     tps = n_outputs / total_time
 
-    output = tokenizer.decode(response[0, n_inputs:], skip_special_tokens=True)
+    output = tokenizer.decode(response[0, n_inputs:], skip_special_tokens=False)
 
     console = Console()
     console.print(Markdown(output))
