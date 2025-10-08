@@ -59,6 +59,8 @@ class ServerInfo:
 
     public_name: Optional[str] = None
     version: Optional[str] = None
+    operating_system: Optional[str] = None
+    video_card: Optional[str] = None
 
     network_rps: Optional[RPS] = None
     forward_rps: Optional[RPS] = None

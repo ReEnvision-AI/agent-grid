@@ -14,6 +14,7 @@ import gc
 import math
 import multiprocessing as mp
 import os
+import platform
 import random
 import sys
 import threading
@@ -41,7 +42,7 @@ from agentgrid.server.from_pretrained import load_pretrained_block
 from agentgrid.server.handler import TransformerConnectionHandler
 from agentgrid.server.memory_cache import MemoryCache
 from agentgrid.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
-from agentgrid.server.throughput import get_dtype_name, get_server_throughput
+from agentgrid.server.throughput import get_dtype_name, get_device_name, get_server_throughput
 from agentgrid.utils.auto_config import AutoDistributedConfig
 from agentgrid.utils.convert_block import QuantType, check_device_balance, convert_block
 from agentgrid.utils.dht import declare_active_modules, get_remote_module_infos
@@ -384,6 +385,9 @@ class Server:
                 sys.exit(0)
         else:
             throughput_info = {"throughput": throughput}
+
+        operating_system = self._get_operating_system()
+        video_card = self._get_video_card()
         self.server_info = ServerInfo(
             state=ServerState.JOINING,
             public_name=public_name,
@@ -392,8 +396,17 @@ class Server:
             torch_dtype=str(torch_dtype).replace("torch.", ""),
             quant_type=quant_type.name.lower(),
             using_relay=reachable_via_relay,
+            operating_system=operating_system,
+            video_card=video_card,
             **throughput_info,
         )
+        if operating_system or video_card:
+            env_bits = []
+            if operating_system:
+                env_bits.append(f"OS: {operating_system}")
+            if video_card:
+                env_bits.append(f"GPU: {video_card}")
+            logger.info("Server environment details - %s", "; ".join(env_bits))
         self._throughput_info = throughput_info
         self._reachable_via_relay = reachable_via_relay
         self.model_info = ModelInfo(num_blocks=self.block_config.num_hidden_layers)
@@ -407,6 +420,42 @@ class Server:
 
         self.module_container = None
         self.stop = threading.Event()
+
+    def _get_operating_system(self) -> Optional[str]:
+        system = platform.system()
+        if not system:
+            return None
+        release = platform.release()
+        if release:
+            return f"{system} {release}"
+        return system
+
+    def _get_video_card(self) -> Optional[str]:
+        devices = getattr(self, "tensor_parallel_devices", ())
+        if not devices:
+            return None
+        device_names = []
+        for device in devices:
+            try:
+                device_names.append(get_device_name(device))
+            except Exception:
+                device_names.append(device.type.upper())
+        if not device_names:
+            return None
+
+        counts: Dict[str, int] = {}
+        order: List[str] = []
+        for name in device_names:
+            if name not in counts:
+                counts[name] = 0
+                order.append(name)
+            counts[name] += 1
+
+        parts = []
+        for name in order:
+            count = counts[name]
+            parts.append(f"{count}x {name}" if count > 1 else name)
+        return ", ".join(parts)
 
     def _choose_num_blocks(self) -> int:
         num_devices = len(self.tensor_parallel_devices) if self.tensor_parallel_devices else 1
