@@ -50,9 +50,44 @@ def convert_block(
     if freeze:
         block.requires_grad_(False)
 
+    tensor_parallel_devices = tuple(
+        device if isinstance(device, torch.device) else torch.device(device)
+        for device in tensor_parallel_devices
+    )
+
+    if output_device.type == "mps":
+        attn_impl = getattr(config, "_attn_implementation", None)
+        if attn_impl != "eager":
+            logger.info(
+                "Forcing attention implementation to 'eager' for MPS backend instead of %s", attn_impl
+            )
+            config._attn_implementation = "eager"
+
+    if len(tensor_parallel_devices) > 1:
+        unique_types = {device.type for device in tensor_parallel_devices}
+        if unique_types != {"cuda"}:
+            raise ValueError(
+                "Tensor parallelism currently supports CUDA devices only. "
+                f"Detected device types: {sorted(unique_types)}"
+            )
+
+    if output_device.type == "mps" and not hasattr(torch.mps, "current_device"):
+        # tensor_parallel queries torch.mps.current_device(), which may be missing on some builds.
+        def _mps_current_device() -> int:  # pragma: no cover - hardware-specific path
+            return 0
+
+        torch.mps.current_device = _mps_current_device  # type: ignore[assignment]
+
     block = make_tensor_parallel(block, config, tensor_parallel_devices, output_device=output_device)
 
     if quant_type != QuantType.NONE:
+        device_types = {device.type for device in tensor_parallel_devices}
+        if device_types != {"cuda"}:
+            raise ValueError(
+                f"{quant_type.name} quantization requires CUDA devices. "
+                "Re-run with --device cuda or disable quantization via --quant_type none. "
+                f"Detected device types: {sorted(device_types)}."
+            )
         block = quantize_module(block, quant_type=quant_type)
 
     for shard, device in zip(block.module_shards, block.devices):
@@ -70,12 +105,21 @@ def convert_block(
             )
             add_adapter_to_block(block, block_index, adapter_name, adapter_config, adapter_state_dict)
 
+    block.eval()
+
     return block
 
 
 def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
-    # Import bitsandbytes only when necessary, so Agent Grid runs on platforms not supported by bitsandbytes
-    import bitsandbytes as bnb
+    # Import bitsandbytes only when necessary, so Agent Grid can run on platforms without CUDA support
+    try:
+        import bitsandbytes as bnb
+    except Exception as exc:  # pragma: no cover - depends on local environment
+        raise RuntimeError(
+            "bitsandbytes is required for INT8/NF4 quantization. "
+            "Install a CUDA-enabled build (e.g. `pip install agent-grid[gpu]`) or disable quantization with --quant_type none. "
+            f"Original error: {exc}"
+        ) from exc
 
     for n, module in model.named_children():
         if len(list(module.children())) > 0:

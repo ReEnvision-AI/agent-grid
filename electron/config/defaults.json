@@ -1,0 +1,14 @@
+{
+  "pythonPath": "",
+  "envPath": ".env",
+  "modelsPath": "models",
+  "selectedModel": "unsloth/gpt-oss-20b-BF16",
+  "device": "mps",
+  "torchDType": "float16",
+  "quantType": "none",
+  "port": 31331,
+  "identityPath": "",
+  "warmupTokensInterval": 0,
+  "dhtPrefix": "",
+  "throughput": "auto"
+}

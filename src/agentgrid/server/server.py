@@ -113,6 +113,7 @@ class Server:
         use_relay: bool = True,
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
+        warmup_tokens_interval: Optional[int] = None,
         **kwargs,
     ):
         """Create a server with one or more bloom blocks. See run_server.py for documentation."""
@@ -186,9 +187,33 @@ class Server:
             else:
                 device = "cpu"
         device = torch.device(device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            if torch.backends.mps.is_available():
+                logger.warning(
+                    "CUDA backend requested but not available; switching to Apple Metal (MPS)."
+                )
+                device = torch.device("mps")
+            else:
+                logger.warning(
+                    "CUDA backend requested but this PyTorch build lacks CUDA support; falling back to CPU."
+                )
+                device = torch.device("cpu")
         if device.type == "cuda" and device.index is None:
             device = torch.device(device.type, index=0)
         self.device = device
+
+        if self.device.type == "mps":
+            logger.info("Using Apple Metal (MPS) backend")
+            if hasattr(torch.backends, "mps"):
+                try:
+                    torch.backends.mps.matmul.allow_fp16_reduction(True)
+                except AttributeError:
+                    logger.debug("MPS backend does not expose matmul fp16 reduction toggle")
+            torch.set_float32_matmul_precision("medium")
+        elif self.device.type == "cpu":
+            logger.info(
+                "Using CPU backend; throughput will be significantly lower than CUDA or MPS."
+            )
 
         torch_dtype = resolve_block_dtype(self.block_config, DTYPE_MAP[torch_dtype])
         if device.type == "cpu" and torch_dtype == torch.float16:
@@ -203,12 +228,61 @@ class Server:
         if tensor_parallel_devices is None:
             tensor_parallel_devices = (device,)
         self.tensor_parallel_devices = tuple(map(torch.device, tensor_parallel_devices))
+        if any(dev.type == "cuda" for dev in self.tensor_parallel_devices) and not torch.cuda.is_available():
+            raise ValueError(
+                "CUDA tensor-parallel devices were specified, but this environment does not have CUDA support. "
+                "Install a CUDA-enabled PyTorch build or remove --tensor_parallel_devices."
+            )
         if len(self.tensor_parallel_devices) > 1:
+            device_types = {dev.type for dev in self.tensor_parallel_devices}
+            if device_types != {"cuda"}:
+                raise ValueError(
+                    "Tensor parallelism requires CUDA devices. "
+                    f"Detected device types: {sorted(device_types)}"
+                )
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
             check_device_balance(self.tensor_parallel_devices)
 
+        tensor_parallel_device_types = {dev.type for dev in self.tensor_parallel_devices}
+        user_requested_quant_type = quant_type is not None
+
         if quant_type is None:
-            quant_type = QuantType.NF4 if device.type == "cuda" else QuantType.NONE
+            if device.type == "cuda" and tensor_parallel_device_types == {"cuda"}:
+                quant_type = QuantType.NF4
+            else:
+                quant_type = QuantType.NONE
+                if device.type != "cuda":
+                    logger.info(
+                        "Defaulting to --quant_type none for %s devices; CUDA is required for INT8/NF4 quantization.",
+                        device.type.upper(),
+                    )
+                elif tensor_parallel_device_types != {"cuda"}:
+                    logger.info(
+                        "Defaulting to --quant_type none because tensor parallel devices include %s.",
+                        sorted(tensor_parallel_device_types),
+                    )
+        else:
+            if quant_type != QuantType.NONE and device.type != "cuda":
+                message = (
+                    f"{quant_type.name} quantization requires a CUDA device, but primary device is {device.type.upper()}. "
+                    "Defaulting to --quant_type none."
+                )
+                if user_requested_quant_type:
+                    logger.warning(message)
+                    quant_type = QuantType.NONE
+                else:
+                    raise ValueError(message)
+            if quant_type != QuantType.NONE and tensor_parallel_device_types != {"cuda"}:
+                message = (
+                    f"{quant_type.name} quantization requires CUDA tensor-parallel devices, "
+                    f"but detected {sorted(tensor_parallel_device_types)}. "
+                    "Defaulting to --quant_type none."
+                )
+                if user_requested_quant_type:
+                    logger.warning(message)
+                    quant_type = QuantType.NONE
+                else:
+                    raise ValueError(message)
 
         if quant_type == QuantType.NF4 and getattr(self.block_config, "model_type", None) == "gpt_oss":
             logger.warning(
@@ -319,19 +393,20 @@ class Server:
         self.balance_quality = balance_quality
         self.mean_balance_check_period = mean_balance_check_period
         self.mean_block_selection_delay = mean_block_selection_delay
+        self.warmup_tokens_interval = warmup_tokens_interval
 
         self.module_container = None
         self.stop = threading.Event()
 
     def _choose_num_blocks(self) -> int:
-        assert self.device.type in ("cuda", "mps"), (
-            "GPU is not available. If you want to run a CPU-only server, please specify --num_blocks. "
-            "CPU-only servers in the public swarm are discouraged since they are much slower"
-        )
         num_devices = len(self.tensor_parallel_devices) if self.tensor_parallel_devices else 1
 
         if num_devices > 1:
-            assert self.device.type == "cuda", f"Tensor parallelism is not supported on {self.device.type.upper()}"
+            if self.device.type != "cuda":
+                raise ValueError(
+                    "Tensor parallelism is supported only on CUDA devices. "
+                    f"Primary device is {self.device.type.upper()}"
+                )
             memory_per_device = tuple(
                 torch.cuda.get_device_properties(device).total_memory for device in self.tensor_parallel_devices
             )
@@ -345,6 +420,11 @@ class Server:
         elif self.device.type == "cuda":
             total_memory = torch.cuda.get_device_properties(self.device).total_memory
         else:
+            if self.device.type == "cpu":
+                logger.warning(
+                    "Auto-selecting number of transformer blocks for a CPU server. "
+                    "Override with --num_blocks to fine-tune performance."
+                )
             total_memory = psutil.virtual_memory().total
 
         gib = 1024**3
@@ -366,12 +446,12 @@ class Server:
             )
 
         num_blocks = math.floor((total_memory - autograd_memory) / total_memory_per_block)
-        assert num_blocks >= 1, "Your GPU does not have enough memory to serve at least one block"
+        assert num_blocks >= 1, "Not enough memory to serve even one transformer block"
 
         num_blocks = min(num_blocks, self.block_config.num_hidden_layers)
         logger.info(
-            f"Server will fill your GPU memory with {num_blocks} transformer blocks. "
-            f"If you want to leave some free GPU memory, please specify a lesser --num_blocks manually"
+            f"Server will fill available {self.device.type.upper()} memory with {num_blocks} transformer blocks. "
+            f"Specify a smaller --num_blocks to reserve headroom."
         )
         return num_blocks
 
@@ -456,6 +536,7 @@ class Server:
                     quant_type=self.quant_type,
                     tensor_parallel_devices=self.tensor_parallel_devices,
                     should_validate_reachability=self.should_validate_reachability,
+                    warmup_tokens_interval=self.warmup_tokens_interval,
                     start=True,
                 )
             except BlockLoadingOutOfMemoryError as exc:
@@ -582,6 +663,7 @@ class ModuleContainer(threading.Thread):
         quant_type: QuantType,
         tensor_parallel_devices: Sequence[torch.device],
         should_validate_reachability: bool,
+        warmup_tokens_interval: Optional[int] = None,
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
@@ -637,6 +719,7 @@ class ModuleContainer(threading.Thread):
                     memory_cache=memory_cache,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
+                    warmup_tokens_interval=warmup_tokens_interval,
                     args_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression

@@ -29,7 +29,8 @@ def generate_smart(model_id: str) -> None:
         model_name_or_path=model_id,
         torch_dtype=torch.bfloat16,
         initial_peers=["/ip4/127.0.0.1/tcp/31331/p2p/Qmbnu3pqyWvXaehb5si5mpyeVQh7RZMPcrrWBX2gnWcc3D"],
-    ).to("cuda")
+        device_map="auto"
+    )
 
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)

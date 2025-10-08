@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Agent Grid Preferences</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <h1>Agent Grid Preferences</h1>
+    <section>
+      <label>Python Path
+        <input id="pythonPath" type="text" placeholder="/path/to/python" />
+      </label>
+    </section>
+
+    <section>
+      <label>.env Path
+        <input id="envPath" type="text" placeholder=".env" />
+      </label>
+    </section>
+
+    <section>
+      <label>Models Path
+        <input id="modelsPath" type="text" placeholder="models" />
+      </label>
+    </section>
+
+    <section>
+      <label>Model
+        <select id="modelSelect"></select>
+      </label>
+    </section>
+
+    <section>
+      <label>Device
+        <select id="deviceSelect"></select>
+      </label>
+    </section>
+
+    <section class="grid">
+      <label>Torch dtype
+        <input id="torchDType" type="text" />
+      </label>
+      <label>Quant type
+        <input id="quantType" type="text" />
+      </label>
+      <label>Port
+        <input id="port" type="number" />
+      </label>
+      <label>Warmup interval
+        <input id="warmupTokensInterval" type="number" />
+      </label>
+    </section>
+
+    <section>
+      <label>Identity Path
+        <input id="identityPath" type="text" placeholder="Optional: /path/to/identity.key" />
+      </label>
+    </section>
+
+  
+    <section class="actions">
+      <button id="saveSettings">Save</button>
+      <button id="startServer">Start Server</button>
+      <button id="stopServer">Stop Server</button>
+    </section>
+
+    <section>
+      <h2>Logs</h2>
+      <pre id="logViewer"></pre>
+    </section>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>

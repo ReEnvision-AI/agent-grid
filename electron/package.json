@@ -1,0 +1,54 @@
+{
+  "name": "agent-grid-electron",
+  "version": "1.0.5",
+  "description": "Electron menu bar companion for Agent Grid",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "build": "electron-builder --mac --arm64 --publish=never",
+    "dist": "electron-builder --mac --arm64 --publish=always",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "electron-store": "^9.0.0",
+    "electron-log": "^5.1.2"
+  },
+  "devDependencies": {
+    "electron": "^28.2.3",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "ai.reenvision.agentgrid",
+    "productName": "Agent Grid",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*",
+      "!python-runtime/**"
+    ],
+    "icon": "assets/icons/icon",
+    "extraResources": [
+      {
+        "from": "python-runtime",
+        "to": "python-runtime"
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "extendInfo": {
+        "LSUIElement": "1"
+      }
+    }
+  }
+}
