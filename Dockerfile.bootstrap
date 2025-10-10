@@ -26,10 +26,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 RUN chown agentgrid:agentgrid /app
 
-# Copy source code and pyproject.toml
-COPY --chown=agentgrid:agentgrid src/ /app/src/
+# Copy dependency definitions and local dependencies first for caching
 COPY --chown=agentgrid:agentgrid pyproject.toml /app/
+COPY --chown=agentgrid:agentgrid deps/ /app/deps/
+
+# Copy the rest of the source and config files
+COPY --chown=agentgrid:agentgrid src/ /app/src/
 COPY --chown=agentgrid:agentgrid identity_files/ /app/identity_files/
+
+# Upgrade pip to ensure support for local file dependency URLs
+RUN pip install --no-cache-dir --upgrade pip
 
 # Install CPU-only torch first for faster build
 RUN pip install torch==2.6.0 --no-cache-dir --index-url https://download.pytorch.org/whl/cpu

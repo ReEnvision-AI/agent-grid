@@ -31,7 +31,7 @@ maintainers = [
 ]
 description = "Easy way to efficiently run 100B+ language models without high-end GPUs"
 readme = "README.md"
-license = {text = "Apache-2.0"}  # Update this to your actual license
+license = {text = "Apache-2.0"} # Update this to your actual license
 requires-python = ">=3.11"
 keywords = [
     "language-models",
@@ -45,7 +45,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",  # Update based on your license
+    "License :: OSI Approved :: Apache Software License", # Update based on your license
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -57,12 +57,12 @@ classifiers = [
     "Topic :: Software Development",
     "Topic :: Software Development :: Libraries",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Typing :: Typed",  # Add if you have type hints
+    "Typing :: Typed", # Add if you have type hints
 ]
 dependencies = [
     # Core minimal dependencies
     "Dijkstar==2.6.0",
-    "requests==2.31.0", 
+    "requests==2.31.0",
     "packaging==25.0",
     "async-timeout==5.0.1",
     "humanfriendly==10.0",
@@ -72,13 +72,13 @@ dependencies = [
 
 [project.optional-dependencies]
 bootstrap = [
-    "transformers[torch]==4.54.1",  # if you change this, please also change version assert in agentgrid/__init__.py
-    "hivemind[cpu] @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
+    "transformers[torch]==4.55.4", # if you change this, please also change version assert in agentgrid/__init__.py
+    "hivemind[cpu] @ file:./deps/hivemind-1.2.5-py3-none-any.whl",
 ]
 inference = [
     # Cross-platform inference dependencies
     "torch==2.6.0",
-    "hivemind @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
+    "hivemind @ file:./deps/hivemind-1.2.5-py3-none-any.whl",
     "accelerate==1.7.0",
     "huggingface-hub==0.34.3",
     "tokenizers==0.21.2",
@@ -88,7 +88,7 @@ inference = [
     "peft==0.8.2",
     "safetensors==0.5.3",
     "numpy==2.3.1",
-    "transformers==4.55.4",  # if you change this, please also change version assert in agentgrid/__init__.py
+    "transformers==4.55.4", # if you change this, please also change version assert in agentgrid/__init__.py
 ]
 gpu = [
     # GPU-only acceleration dependencies (Linux-supported)
@@ -167,7 +167,7 @@ namespaces = false
 version = {file = ["src/agentgrid/VERSION"]}
 
 [tool.setuptools.package-data]
-agentgrid = ["VERSION", "py.typed"]  # Include VERSION file and py.typed if you have type hints
+agentgrid = ["VERSION", "py.typed"] # Include VERSION file and py.typed if you have type hints
 
 # Development tools configuration
 
@@ -194,8 +194,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"]  # unused imports in __init__ files
-"tests/*" = ["S101"]  # allow assert in tests
+"__init__.py" = ["F401"] # unused imports in __init__ files
+"tests/*" = ["S101"] # allow assert in tests
 
 [tool.black]
 line-length = 120
@@ -274,3 +274,4 @@ exclude_lines = [
 ]
 precision = 2
 show_missing = true
+
