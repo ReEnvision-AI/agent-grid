@@ -1,14 +1,15 @@
 {
   "name": "agent-grid-electron",
-  "version": "1.0.6",
-  "description": "Electron menu bar companion for Agent Grid",
+  "productName": "Agent Grid",
+  "version": "1.0.7",
+  "description": "Menu bar companion for Agent Grid",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "dev": "electron .",
-    "build": "electron-builder --mac --arm64 --publish=never",
-    "dist": "electron-builder --mac --arm64 --publish=always",
-    "clean": "rm -rf dist"
+    "start": "electron-forge start",
+    "dev": "electron-forge start",
+    "package": "electron-forge package --platform=darwin --arch=arm64",
+    "make": "electron-forge make --platform=darwin --arch=arm64",
+    "clean": "rm -rf out"
   },
   "keywords": [],
   "author": "",
@@ -19,36 +20,13 @@
     "electron-log": "^5.1.2"
   },
   "devDependencies": {
+    "@electron-forge/cli": "^7.4.0",
+    "@electron-forge/maker-dmg": "^7.4.0",
+    "@electron-forge/maker-zip": "^7.4.0",
     "electron": "^28.2.3",
-    "electron-builder": "^24.13.3"
+    "dotenv": "^16.4.5"
   },
-  "build": {
-    "appId": "ai.reenvision.agentgrid",
-    "productName": "Agent Grid",
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "**/*",
-      "!python-runtime/**"
-    ],
-    "icon": "assets/icons/icon",
-    "extraResources": [
-      {
-        "from": "python-runtime",
-        "to": "python-runtime"
-      }
-    ],
-    "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
-      "category": "public.app-category.developer-tools",
-      "identity": null,
-      "extendInfo": {
-        "LSUIElement": "1"
-      }
-    }
+  "config": {
+    "forge": "./forge.config.js"
   }
 }

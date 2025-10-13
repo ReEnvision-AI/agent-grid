@@ -95,6 +95,27 @@ echo "Installing Agent Grid (${PIP_INSTALL_SPEC}) into bundled venv..."
   "${VENV_PIP}" install --no-cache-dir "${PIP_INSTALL_SPEC}"
 )
 
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+if [[ -n "${CODESIGN_IDENTITY}" ]]; then
+  echo "Codesigning bundled runtime with identity: ${CODESIGN_IDENTITY}"
+  sign_targets=()
+  while IFS= read -r -d '' candidate; do
+    if file "${candidate}" | grep -qE 'Mach-O (64-bit|universal)'; then
+      sign_targets+=("${candidate}")
+    fi
+  done < <(find "${PYTHON_DIR}" "${VENV_PATH}" -type f -print0)
+
+  if [[ ${#sign_targets[@]} -eq 0 ]]; then
+    echo "Warning: No Mach-O binaries detected to sign under ${PYTHON_DIR}."
+  else
+    for target in "${sign_targets[@]}"; do
+      codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${target}"
+    done
+  fi
+else
+  echo "Skipping codesign step; set CODESIGN_IDENTITY to sign the runtime before packaging."
+fi
+
 ARCHIVE_PATH="${TARGET_ROOT}.tar.gz"
 echo "Creating compressed runtime archive at ${ARCHIVE_PATH}"
 tar -czf "${ARCHIVE_PATH}" -C "${TARGET_ROOT}" .
