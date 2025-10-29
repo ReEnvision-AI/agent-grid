@@ -1,4 +1,4 @@
-const { app, Menu, Tray, dialog, BrowserWindow, ipcMain, shell, nativeImage, powerSaveBlocker } = require('electron');
+const { app, Menu, Tray, dialog, BrowserWindow, ipcMain, shell, nativeImage, powerSaveBlocker, powerMonitor } = require('electron');
 
 // Quit if not on Apple Silicon, which is required for the bundled Python runtime.
 if (process.platform === 'darwin' && process.arch !== 'arm64') {
@@ -16,6 +16,24 @@ const { spawn } = require('child_process');
 const { ensurePythonRuntime } = require('./runtime/bootstrap');
 const defaults = require('./config/defaults.json');
 
+let tray;
+let preferencesWindow;
+let serverProcess = null;
+let serverState = 'stopped';
+let runtimeState = 'pending';
+let runtimeErrorMessage = null;
+let runtimeMetadata = null;
+let powerSaveBlockerId = null;
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  log.warn('[app] Another Agent Grid instance detected. Exiting this instance.');
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    log.info('[app] Second launch detected — existing instance already running.');
+  });
+}
 
 let store;
 
@@ -37,15 +55,6 @@ const MODELS = [
   'unsloth/gpt-oss-20b-BF16'
 ];
 
-let tray;
-let preferencesWindow;
-let serverProcess = null;
-let serverState = 'stopped';
-let runtimeState = 'pending';
-let runtimeErrorMessage = null;
-let runtimeMetadata = null;
-let powerSaveBlockerId = null;
-
 function createTray() {
   updateTrayIcon();
   buildTrayMenu();
@@ -65,11 +74,185 @@ function allowSleep() {
   if (powerSaveBlockerId) {
     powerSaveBlocker.stop(powerSaveBlockerId);
     powerSaveBlockerId = null;
-    log.info('[sleep] 😴 Sleep prevention DISABLED - System can now sleep normally');
-    log.info('[sleep] 💤 Your Mac will resume normal sleep behavior');
+    log.info('[sleep] Sleep prevention DISABLED - System can now sleep normally');
+    log.info('[sleep] Your Mac will resume normal sleep behavior');
   } else {
-    log.info('[sleep] ℹ️ Sleep prevention already disabled');
+    log.info('[sleep] Sleep prevention already disabled');
   }
+}
+
+// Power state management functions
+function saveServerStateBeforeSleep() {
+  const settingsStore = getStore();
+  const currentState = {
+    serverState: serverState,
+    powerState: powerMonitor.isOnBatteryPower() ? 'battery' : 'ac',
+    timestamp: Date.now(),
+    serverProcessId: serverProcess?.pid || null
+  };
+
+  settingsStore.set('serverStateBeforeSleep', currentState.serverState);
+  settingsStore.set('powerStateBeforeSleep', currentState.powerState);
+  settingsStore.set('sleepTimestamp', currentState.timestamp);
+
+  log.info('[power] 💾 Server state saved before sleep:', currentState);
+  return currentState;
+}
+
+function getSavedServerState() {
+  const settingsStore = getStore();
+  return {
+    serverState: settingsStore.get('serverStateBeforeSleep', 'stopped'),
+    powerState: settingsStore.get('powerStateBeforeSleep', 'unknown'),
+    timestamp: settingsStore.get('sleepTimestamp', null)
+  };
+}
+
+function shouldRestoreServerOnWake() {
+  const settings = readSettings();
+  const savedState = getSavedServerState();
+  const currentPowerState = powerMonitor.isOnBatteryPower() ? 'battery' : 'ac';
+
+  // Check user preference
+  const restorePreference = settings.restoreServerOnWake || 'always';
+
+  if (restorePreference === 'never') {
+    log.info('[power] Auto-restore disabled by user preference');
+    return false;
+  }
+
+  if (restorePreference === 'ac-only' && currentPowerState === 'battery') {
+    log.info('[power] Auto-restore skipped: on battery power and user set "AC only"');
+    return false;
+  }
+
+  // Only restore if server was actually running
+  if (savedState.serverState !== 'running') {
+    log.info('[power] ⏸Auto-restore skipped: server was not running before sleep');
+    return false;
+  }
+
+  // Check if this is a rapid sleep/wake cycle (less than 30 seconds)
+  if (savedState.timestamp && (Date.now() - savedState.timestamp) < 30000) {
+    log.info('[power] ⚡ Auto-restore skipped: rapid sleep/wake cycle detected');
+    return false;
+  }
+
+  log.info('[power] Auto-restore conditions met');
+  return true;
+}
+
+async function restoreServerAfterWake() {
+  log.info('[power] Starting server restoration after wake...');
+
+  // Wait a bit for system to fully wake up
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
+  if (!shouldRestoreServerOnWake()) {
+    return;
+  }
+
+  try {
+    // Check if runtime is ready
+    if (runtimeState !== 'ready') {
+      log.warn('[power] Runtime not ready, postponing restoration');
+      return;
+    }
+
+    // Check if server is already running
+    if (serverState === 'running') {
+      log.info('[power] Server already running after wake');
+      return;
+    }
+
+    log.info('[power] Restoring server after wake...');
+    startServer();
+
+    // Show notification
+    if (process.platform === 'darwin') {
+      const { Notification } = require('electron');
+      new Notification({
+        title: 'Agent Grid',
+        body: 'Server automatically restored after wake',
+        silent: true
+      }).show();
+    }
+
+  } catch (error) {
+    log.error('[power] Failed to restore server after wake:', error);
+  }
+}
+
+function handleSystemSuspend() {
+  log.info('[power] System entering sleep mode');
+
+  // Save current server state
+  const savedState = saveServerStateBeforeSleep();
+
+  // Stop server if it's running (unless user prefers to keep it running on AC)
+  const settings = readSettings();
+  const keepRunning = settings.keepServerRunningOnLidClose && !powerMonitor.isOnBatteryPower();
+
+  if (serverState === 'running' && !keepRunning) {
+    log.info('[power] Stopping server before sleep');
+    stopServer();
+  } else if (serverState === 'running' && keepRunning) {
+    log.info('[power] ⚡ Server continues running (AC power + user preference)');
+  }
+}
+
+function handleSystemResume() {
+  log.info('[power] System resuming from sleep');
+
+  // Start restoration process with a delay
+  setTimeout(() => {
+    restoreServerAfterWake();
+  }, 3000);
+}
+
+function handlePowerSourceChange() {
+  const currentPowerState = powerMonitor.isOnBatteryPower() ? 'battery' : 'ac';
+  log.info(`[power] Power source changed to: ${currentPowerState}`);
+
+  // If server is running and we're now on battery, notify user
+  if (serverState === 'running' && currentPowerState === 'battery') {
+    log.info('[power] Server now running on battery power');
+
+    // Show notification
+    if (process.platform === 'darwin') {
+      const { Notification } = require('electron');
+      new Notification({
+        title: 'Agent Grid',
+        body: 'Server running on battery power',
+        subtitle: 'Consider connecting to AC power for optimal performance',
+        silent: true
+      }).show();
+    }
+  }
+}
+
+// Initialize power event listeners
+function initializePowerMonitoring() {
+  log.info('[power] Initializing power monitoring system');
+
+  // System sleep/wake events
+  powerMonitor.on('suspend', handleSystemSuspend);
+  powerMonitor.on('resume', handleSystemResume);
+
+  // Power source change events
+  powerMonitor.on('on-ac', () => {
+    log.info('[power] Connected to AC power');
+    handlePowerSourceChange();
+  });
+
+  powerMonitor.on('on-battery', () => {
+    log.info('[power] Switched to battery power');
+    handlePowerSourceChange();
+  });
+
+  // Log initial power state
+  const initialPowerState = powerMonitor.isOnBatteryPower() ? 'battery' : 'ac';
+  log.info(`[power] Initial power state: ${initialPowerState}`);
 }
 
 function updateTrayIcon() {
@@ -474,6 +657,10 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+
+  // Initialize power monitoring
+  initializePowerMonitoring();
+
   createTray();
   if (process.platform === 'darwin') {
     try {

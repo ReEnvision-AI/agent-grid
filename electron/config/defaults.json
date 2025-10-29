@@ -10,5 +10,11 @@
   "identityPath": "",
   "warmupTokensInterval": 0,
   "dhtPrefix": "",
-  "throughput": "auto"
+  "throughput": "auto",
+  "restoreServerOnWake": "always",
+  "keepServerRunningOnLidClose": false,
+  "lidCloseAction": "sleep",
+  "serverStateBeforeSleep": "stopped",
+  "powerStateBeforeSleep": "unknown",
+  "sleepTimestamp": null
 }
