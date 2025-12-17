@@ -50,8 +50,16 @@ function populateDevices(devices) {
   });
 }
 
+let logLines = [];
+const MAX_LOG_LINES = 1000;
+
 function appendLog(message) {
-  elements.logViewer.textContent += message;
+  const newLines = message.split('\n');
+  logLines.push(...newLines);
+  if (logLines.length > MAX_LOG_LINES) {
+    logLines = logLines.slice(logLines.length - MAX_LOG_LINES);
+  }
+  elements.logViewer.textContent = logLines.join('\n');
   elements.logViewer.scrollTop = elements.logViewer.scrollHeight;
 }
 

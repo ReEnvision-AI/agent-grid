@@ -496,12 +496,12 @@ class Server:
         elif self.device.type == "cuda":
             total_memory = torch.cuda.get_device_properties(self.device).total_memory
         else:
-            if self.device.type == "cpu":
+            if self.device.type in ("cpu", "mps"):
                 logger.warning(
-                    "Auto-selecting number of transformer blocks for a CPU server. "
+                    f"Auto-selecting number of transformer blocks for a {self.device.type.upper()} server. "
                     "Override with --num_blocks to fine-tune performance."
                 )
-            total_memory = psutil.virtual_memory().total
+            total_memory = psutil.virtual_memory().available
 
         gib = 1024**3
         autograd_memory = 0  # Removed backward pass, so autograd_memory is 0
