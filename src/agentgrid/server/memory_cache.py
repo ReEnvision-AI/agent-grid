@@ -17,6 +17,7 @@ For now, the only purpose of this code is to ensure that allocated memory will b
 import asyncio
 import contextlib
 import ctypes
+import gc
 import multiprocessing as mp
 import os
 import time
@@ -54,6 +55,9 @@ class MemoryCache:
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
 
+        # Initialize CUDA memory pool optimizations
+        self._initialize_cuda_memory_pools()
+
         # Compaction parameters
         self.COMPACTION_THRESHOLD = 10  # Compact if a bucket has more than this many tensors
         self._compaction_counter = 0
@@ -69,6 +73,14 @@ class MemoryCache:
         self._compaction_count = 0
         self._last_monitoring_log = time.time()
         self._monitoring_interval = 60.0  # Log memory stats every 60 seconds
+
+        # Optimized garbage collection parameters
+        self._gc_counter = 0
+        self._gc_interval = 1000  # Run GC every 1000 cache uses (was 100)
+        self._gc_time_threshold = 0.001  # 1ms minimum time between GC calls
+        self._last_gc_time = 0.0
+        self._memory_pressure_gc_threshold = 0.85  # Trigger GC more aggressively under high memory pressure
+        self._gc_min_objects = 100  # Only run GC if we expect to collect at least this many objects
 
         # Predictive allocation
         self._session_patterns: Dict[str, List[List[TensorDescriptor]]] = {}
@@ -106,6 +118,126 @@ class MemoryCache:
     @handle_counter.setter
     def handle_counter(self, value: int):
         self._handle_counter.value = value
+
+    def _initialize_cuda_memory_pools(self):
+        """Initialize CUDA memory pool optimizations"""
+        if torch.cuda.is_available():
+            try:
+                # Enable CUDA memory pool for more efficient memory allocation
+                # This reduces fragmentation and improves allocation speed
+                for device_id in range(torch.cuda.device_count()):
+                    device = torch.device(f'cuda:{device_id}')
+                    with torch.cuda.device(device):
+                        # Set memory fraction to prevent oversubscription
+                        torch.cuda.set_per_process_memory_fraction(0.9, device_id)
+                        logger.info(f"Initialized CUDA memory pool for device {device_id}")
+
+                # Clear any existing cached memory
+                torch.cuda.empty_cache()
+                logger.info("Cleared CUDA memory cache during initialization")
+
+            except Exception as e:
+                logger.warning(f"Failed to initialize CUDA memory pools: {e}")
+
+    def force_garbage_collection(self, aggressive: bool = False) -> int:
+        """
+        Optimized force garbage collection with performance safeguards.
+
+        :param aggressive: If True, bypasses performance optimizations for urgent cleanup
+        :return: Number of objects collected
+        """
+        current_time = time.perf_counter()
+
+        # Performance optimization: Skip GC if called too frequently
+        if not aggressive and (current_time - self._last_gc_time) < self._gc_time_threshold:
+            return 0
+
+        try:
+            # Check if we should run GC based on memory pressure
+            if not aggressive:
+                memory_pressure = self._get_memory_pressure()
+                # Only run GC if under significant memory pressure
+                if memory_pressure < self._memory_pressure_gc_threshold:
+                    return 0
+
+            # Collect Python garbage
+            collected = gc.collect()
+
+            # Only clear device caches if we collected objects or being aggressive
+            if collected > 0 or aggressive:
+                # Clear CUDA cache if available with device-specific clearing
+                if torch.cuda.is_available():
+                    # Clear cache for all CUDA devices
+                    for device_id in range(torch.cuda.device_count()):
+                        with torch.cuda.device(device_id):
+                            torch.cuda.empty_cache()
+                            # Reset peak memory stats to get accurate readings
+                            torch.cuda.reset_peak_memory_stats(device_id)
+
+                # Clear MPS cache if available (Apple Silicon)
+                if hasattr(torch.backends.mps, 'empty_cache'):
+                    torch.backends.mps.empty_cache()
+
+            self._last_gc_time = current_time
+
+            if collected > 0:
+                logger.debug(f"Garbage collection completed, collected {collected} objects")
+
+            return collected
+        except Exception as e:
+            logger.warning(f"Force garbage collection failed: {e}")
+            return 0
+
+    def _should_run_gc(self) -> bool:
+        """Determine if garbage collection should run based on heuristics"""
+        # Check time-based frequency
+        current_time = time.perf_counter()
+        if (current_time - self._last_gc_time) < self._gc_time_threshold:
+            return False
+
+        # Check memory pressure
+        memory_pressure = self._get_memory_pressure()
+        if memory_pressure > self._memory_pressure_gc_threshold:
+            return True
+
+        # Check call frequency
+        self._gc_counter += 1
+        if self._gc_counter >= self._gc_interval:
+            self._gc_counter = 0
+            return True
+
+        return False
+
+    def ensure_memory_available(self, required_bytes: int, device: Optional[torch.device] = None):
+        """
+        Proactively evict memory to ensure enough space for allocation.
+
+        :param required_bytes: Amount of memory needed for allocation
+        :param device: Optional device to check memory for
+        """
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+
+        if total_used + required_bytes > self.max_size_bytes:
+            # Calculate how much memory we need to free
+            memory_shortfall = (total_used + required_bytes) - self.max_size_bytes
+            buffer = 1024 * 1024 * 100  # 100MB buffer for safety
+            bytes_to_evict = min(self._pooled_size_bytes.value, memory_shortfall + buffer)
+
+            if bytes_to_evict > 0:
+                logger.info(f"Proactively evicting {bytes_to_evict / 1024**2:.2f} MB for {required_bytes / 1024**2:.2f} MB allocation")
+                self._evict_memory(bytes_to_evict)
+
+                # Only force garbage collection after eviction if significant memory was freed
+                if bytes_to_evict > 100 * 1024 * 1024:  # Only if >100MB evicted
+                    self.force_garbage_collection()
+
+            # Check if we still don't have enough memory after eviction
+            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                total_used_after = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+
+            if total_used_after + required_bytes > self.max_size_bytes:
+                logger.warning(f"Still insufficient memory after eviction: need {required_bytes / 1024**2:.2f} MB, available {(self.max_size_bytes - total_used_after) / 1024**2:.2f} MB")
 
     def end_session(self, session_id: str):
         """
@@ -156,6 +288,9 @@ class MemoryCache:
             yield handles
         finally:
             self._free(max_alloc_size, alloc_task)
+            # Only force garbage collection if under memory pressure (lightweight optimization)
+            if self._get_memory_pressure() > 0.8:  # Only if >80% memory usage
+                self.force_garbage_collection()
 
     @staticmethod
     def get_allocation_size(*descriptors: TensorDescriptor) -> int:
@@ -177,6 +312,12 @@ class MemoryCache:
             - hivemind.utils.enter_asynchronously() does not always release the lock on cancellation
         """
         try:
+            # Proactively ensure memory is available before waiting for free memory
+            if descriptors:
+                # Use the device from the first descriptor (most important one)
+                primary_device = descriptors[0].device
+                self.ensure_memory_available(alloc_size, primary_device)
+
             async with self._wait_for_free_memory(alloc_size, timeout):
                 with self._lock_metadata:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
@@ -462,11 +603,18 @@ class MemoryCache:
         # Step 1: Adaptive periodic compaction
         self._compaction_counter += 1
         adaptive_interval = self._calculate_adaptive_interval()
-        
+
         if self._compaction_counter >= adaptive_interval:
             self._compact_memory_pools()
             self._compaction_counter = 0
             self._compaction_count += 1
+
+        # Step 1.5: Optimized periodic garbage collection
+        # Only run GC when needed based on memory pressure and frequency
+        if self._should_run_gc():
+            collected = self.force_garbage_collection()
+            if collected > 0:
+                logger.debug(f"Periodic GC collected {collected} objects")
 
         # Step 2: Evict memory if cache is over budget
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
@@ -572,6 +720,39 @@ class MemoryCache:
 
         # Step 4: Yield tensors
         yield tuple(self._allocated_tensors[handle] for handle in handles)
+
+    def force_memory_cleanup(self, target_free_bytes: Optional[int] = None) -> int:
+        """
+        Force aggressive memory cleanup and eviction.
+
+        :param target_free_bytes: Target amount of memory to free, if None tries to free all pooled memory
+        :return: Total bytes freed
+        """
+        total_freed = 0
+
+        try:
+            # Step 1: Force garbage collection
+            collected = self.force_garbage_collection()
+            logger.info(f"Force cleanup: collected {collected} Python objects")
+
+            # Step 2: Evict pooled memory
+            if target_free_bytes is None:
+                # Try to free all pooled memory
+                target_free_bytes = self._pooled_size_bytes.value
+
+            if target_free_bytes > 0:
+                self._evict_memory(target_free_bytes)
+                total_freed += target_free_bytes
+                logger.info(f"Force cleanup: evicted {target_free_bytes / 1024**2:.2f} MB from memory pools")
+
+            # Step 3: Final garbage collection
+            final_collected = self.force_garbage_collection()
+            logger.info(f"Force cleanup: final GC collected {final_collected} objects")
+
+        except Exception as e:
+            logger.error(f"Force memory cleanup failed: {e}")
+
+        return total_freed
 
     def recycle_tensors(self, tensors: Sequence[torch.Tensor]) -> None:
         """Return temporary tensors back to the free pool for future reuse."""

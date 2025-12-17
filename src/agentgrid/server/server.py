@@ -295,13 +295,25 @@ class Server:
                 else:
                     raise ValueError(message)
 
+        original_quant_type = quant_type
         if quant_type == QuantType.NF4 and getattr(self.block_config, "model_type", None) == "gpt_oss":
             logger.warning(
                 "NF4 quantization is not supported for GPT-OSS blocks; falling back to bfloat16 weights"
             )
             quant_type = QuantType.NONE
+            # For GPT-OSS with failed quantization, we need to account for higher memory usage
+            self.gpt_oss_quantization_fallback = True
+            self.memory_overhead_multiplier = 4.0  # NF4->bfloat16 is 4x memory
+        else:
+            self.gpt_oss_quantization_fallback = False
+            self.memory_overhead_multiplier = 1.0
+
         self.quant_type = quant_type
+        self.original_requested_quant_type = original_quant_type
+
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
+        if self.gpt_oss_quantization_fallback:
+            logger.warning(f"GPT-OSS quantization fallback: Memory usage will be {self.memory_overhead_multiplier}x higher than originally expected")
 
         if hasattr(self.block_config, "block_configs") and self.block_config.block_configs is not None:
             num_key_value_groups = [
@@ -341,6 +353,11 @@ class Server:
         else:
             cache_values_per_block = base_cache_values_per_block // num_key_value_groups
             self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
+
+        # Apply GPT-OSS quantization fallback memory overhead correction
+        if self.gpt_oss_quantization_fallback:
+            self._cache_bytes_per_block = int(self._cache_bytes_per_block * self.memory_overhead_multiplier)
+            logger.info(f"Applied GPT-OSS quantization fallback correction: cache bytes per block increased to {self._cache_bytes_per_block // (1024**2):.0f} MB")
 
         # For disk cache
         self.cache_dir = cache_dir
@@ -596,6 +613,7 @@ class Server:
                     tensor_parallel_devices=self.tensor_parallel_devices,
                     should_validate_reachability=self.should_validate_reachability,
                     warmup_tokens_interval=self.warmup_tokens_interval,
+                    gpt_oss_fallback=getattr(self, 'gpt_oss_quantization_fallback', False),
                     start=True,
                 )
             except BlockLoadingOutOfMemoryError as exc:
@@ -723,10 +741,19 @@ class ModuleContainer(threading.Thread):
         tensor_parallel_devices: Sequence[torch.device],
         should_validate_reachability: bool,
         warmup_tokens_interval: Optional[int] = None,
+        gpt_oss_fallback: bool = False,
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
-        memory_cache = MemoryCache(attn_cache_bytes, max_alloc_timeout)
+        # Apply additional safety buffer for GPT-OSS quantization fallback
+        cache_bytes = attn_cache_bytes
+        if gpt_oss_fallback:
+            # Add 20% safety buffer for GPT-OSS due to quantization fallback unpredictability
+            safety_buffer = int(cache_bytes * 0.2)
+            cache_bytes += safety_buffer
+            logger.info(f"Added GPT-OSS safety buffer: {safety_buffer // (1024**2):.0f} MB")
+
+        memory_cache = MemoryCache(cache_bytes, max_alloc_timeout)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
