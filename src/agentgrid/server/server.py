@@ -335,7 +335,15 @@ class Server:
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
-            inference_max_length = 8192 if is_multiquery_attn else 2048
+            # Try to get max length from model config
+            config_max_length = getattr(self.block_config, "max_position_embeddings", None)
+            if config_max_length is not None and isinstance(config_max_length, int):
+                inference_max_length = config_max_length
+                logger.info(f"Model has 'max_position_embeddings' of {self.block_config.max_position_embeddings}")
+            else:
+                logger.info("Model does not have 'max_position_embeddings")
+                logger.info(self.block_config)
+                inference_max_length = 8192 if is_multiquery_attn else 2048
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.inference_max_length = inference_max_length
         self.max_chunk_size_bytes = max_chunk_size_bytes
@@ -343,7 +351,10 @@ class Server:
 
         # For attention cache in GPU or RAM
         if attn_cache_tokens is None:
-            attn_cache_tokens = 16384 if is_multiquery_attn else 4096
+            default_cache_tokens = 16384 if is_multiquery_attn else 4096
+            # Ensure cache is at least as large as the max sequence length we support
+            attn_cache_tokens = max(default_cache_tokens, inference_max_length)
+
 
         base_cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
         if isinstance(num_key_value_groups, list):

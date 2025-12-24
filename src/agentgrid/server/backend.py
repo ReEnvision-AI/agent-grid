@@ -79,10 +79,7 @@ class AgentGridLayer(CacheLayerMixin):
 
             if prefix_length < new_length:
                 update_slice = slice(prefix_length, new_length)
-                if key_cache_shard.device.type in {"cuda", "mps"} and key_state_shard.ndim == 4:
-                    key_state_shard = key_state_shard.contiguous(memory_format=torch.channels_last)
-                if value_cache_shard.device.type in {"cuda", "mps"} and value_state_shard.ndim == 4:
-                    value_state_shard = value_state_shard.contiguous(memory_format=torch.channels_last)
+                # Optimization: Removed channels_last conversion which adds copy overhead for Transformers
                 key_cache_shard[:, :, update_slice, :] = key_state_shard[:, :, update_slice, :]
                 value_cache_shard[:, :, update_slice, :] = value_state_shard[:, :, update_slice, :]
         self._seq_length = max(self._seq_length, new_length)
@@ -126,8 +123,13 @@ class AgentGridCache(Cache):
 
     def select_layer_past(self, prefix_length: int) -> Sequence[torch.Tensor]:
         layer = self.layers[0]
-        key_shards = [k[:, :, :prefix_length, :] for k in layer.key_shards]
-        value_shards = [v[:, :, :prefix_length, :] for v in layer.value_shards]
+        # Implement sliding window to prevent linear slowdown
+        # On MPS, full attention over >8k tokens becomes bandwidth bound
+        window_size = 8192
+        start_idx = max(0, prefix_length - window_size)
+        
+        key_shards = [k[:, :, start_idx:prefix_length, :] for k in layer.key_shards]
+        value_shards = [v[:, :, start_idx:prefix_length, :] for v in layer.value_shards]
         layer_past = tuple(chain(*zip(key_shards, value_shards)))
         return PerDeviceTensors(*layer_past) if self.num_shards > 1 else layer_past
 
@@ -314,10 +316,6 @@ class TransformerBackend(ModuleBackend):
                     logger.error(f"Cache update failed for block {self.name}: {e}")
                     # Continue processing even if cache update fails
                     pass
-                finally:
-                    if self.device.type == "mps":
-                        tensors_to_recycle = self._flatten_tensors((key_states, value_states))
-                        self.memory_cache.recycle_tensors(tensors_to_recycle)
 
             return (output_hidden_states,)
 

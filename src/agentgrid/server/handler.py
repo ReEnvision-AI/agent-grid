@@ -146,120 +146,119 @@ class TransformerConnectionHandler(ConnectionHandler):
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         """Compute a single step of inference using attention cache; update attention cache accordingly."""
         session_id = None
-        async with timeout(self.session_timeout):
+        try:
+            request = await asyncio.wait_for(anext(requests), self.step_timeout)
+        except asyncio.TimeoutError:
+            self._log_request("rpc_inference.open", None, context, warning="timed out")
+            return
+
+        requested_uids = self._check_uids(request.uid)
+        self._log_request("rpc_inference.open", requested_uids, context)
+        try:
+            metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
+            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
+            max_length = metadata.get("max_length")
+            points = metadata.get("points", 0)
+            session_id = metadata.get("session_id")
+            alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
+            args_structure = metadata.get("args_structure")
+            if not requested_uids:
+                raise ValueError("User must specify at least one block for inference, but got none")
+            assert isinstance(
+                max_length, int
+            ), f"rpc_inference metadata must contain int max_length, got {max_length}"
+            assert isinstance(
+                points, (float, int)
+            ), f"rpc_inference should have number of points as a number or None, got {points}"
+            if not 0 <= max_length <= self.inference_max_length:
+                raise ValueError(
+                    f"Cannot allocate KV cache for {max_length} tokens, max = {self.inference_max_length}"
+                )
+
+            batch_size = request.tensors[0].size[0] if request.tensors else 1
+
             try:
-                request = await asyncio.wait_for(anext(requests), self.step_timeout)
-            except asyncio.TimeoutError:
-                self._log_request("rpc_inference.open", None, context, warning="timed out")
-                return
-
-            requested_uids = self._check_uids(request.uid)
-            self._log_request("rpc_inference.open", requested_uids, context)
-            try:
-                metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-                requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-                max_length = metadata.get("max_length")
-                points = metadata.get("points", 0)
-                session_id = metadata.get("session_id")
-                alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
-                args_structure = metadata.get("args_structure")
-                if not requested_uids:
-                    raise ValueError("User must specify at least one block for inference, but got none")
-                assert isinstance(
-                    max_length, int
-                ), f"rpc_inference metadata must contain int max_length, got {max_length}"
-                assert isinstance(
-                    points, (float, int)
-                ), f"rpc_inference should have number of points as a number or None, got {points}"
-                if not 0 <= max_length <= self.inference_max_length:
-                    raise ValueError(
-                        f"Cannot allocate KV cache for {max_length} tokens, max = {self.inference_max_length}"
-                    )
-
-                batch_size = request.tensors[0].size[0] if request.tensors else 1
-
-                try:
-                    cache_context = self._allocate_cache(
-                        requested_backends,
-                        batch_size=batch_size,
+                cache_context = self._allocate_cache(
+                    requested_backends,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    timeout=alloc_timeout,
+                    session_id=session_id,
+                )
+                async with cache_context as cache_handles:
+                    background_task = None
+                    async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
+                        requested_uids=requested_uids,
+                        requested_backends=requested_backends,
+                        active_adapter=self._get_active_adapter(metadata),
+                        input_iterator=self._iterate_inference_steps(
+                            request, requests, session_id, requested_uids, context
+                        ),
+                        cache_handles=cache_handles,
                         max_length=max_length,
-                        timeout=alloc_timeout,
-                        session_id=session_id,
-                    )
-                    async with cache_context as cache_handles:
-                        background_task = None
-                        async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
-                            requested_uids=requested_uids,
-                            requested_backends=requested_backends,
-                            active_adapter=self._get_active_adapter(metadata),
-                            input_iterator=self._iterate_inference_steps(
-                                request, requests, session_id, requested_uids, context
-                            ),
-                            cache_handles=cache_handles,
+                        prioritizer=self._prioritizer,
+                        points=points,
+                        quant_type=self.quant_type,
+                        args_structure=args_structure,
+                    ):
+                        if can_push:
+                            if background_task is None:
+                                background_task = asyncio.create_task(
+                                    self._push_outputs(request, output_tensors[0], step_metadata)
+                                )
+                        yield runtime_pb2.ExpertResponse(tensors=output_tensors)
+
+            except Exception as e:
+                # Fallback: try to force memory cleanup and retry with longer timeout
+                if "out of memory" in str(e).lower() or "allocation" in str(e).lower():
+                    logger.warning(f"Memory allocation failed, attempting cleanup: {e}")
+                    try:
+                        # Force cleanup on the first backend
+                        first_backend = requested_backends[0]
+                        bytes_freed = first_backend.memory_cache.force_memory_cleanup()
+                        logger.info(f"Force cleanup freed {bytes_freed / 1024**2:.2f} MB")
+
+                        # Retry allocation with a longer timeout
+                        retry_timeout = max(alloc_timeout, 30.0)  # At least 30 seconds
+                        cache_context = self._allocate_cache(
+                            requested_backends,
+                            batch_size=batch_size,
                             max_length=max_length,
-                            prioritizer=self._prioritizer,
-                            points=points,
-                            quant_type=self.quant_type,
-                            args_structure=args_structure,
-                        ):
-                            if can_push:
-                                if background_task is None:
-                                    background_task = asyncio.create_task(
-                                        self._push_outputs(request, output_tensors[0], step_metadata)
-                                    )
-                            yield runtime_pb2.ExpertResponse(tensors=output_tensors)
-
-                except Exception as e:
-                    # Fallback: try to force memory cleanup and retry with longer timeout
-                    if "out of memory" in str(e).lower() or "allocation" in str(e).lower():
-                        logger.warning(f"Memory allocation failed, attempting cleanup: {e}")
-                        try:
-                            # Force cleanup on the first backend
-                            first_backend = requested_backends[0]
-                            bytes_freed = first_backend.memory_cache.force_memory_cleanup()
-                            logger.info(f"Force cleanup freed {bytes_freed / 1024**2:.2f} MB")
-
-                            # Retry allocation with a longer timeout
-                            retry_timeout = max(alloc_timeout, 30.0)  # At least 30 seconds
-                            cache_context = self._allocate_cache(
-                                requested_backends,
-                                batch_size=batch_size,
+                            timeout=retry_timeout,
+                            session_id=session_id,
+                        )
+                        async with cache_context as cache_handles:
+                            background_task = None
+                            async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
+                                requested_uids=requested_uids,
+                                requested_backends=requested_backends,
+                                active_adapter=self._get_active_adapter(metadata),
+                                input_iterator=self._iterate_inference_steps(
+                                    request, requests, session_id, requested_uids, context
+                                ),
+                                cache_handles=cache_handles,
                                 max_length=max_length,
-                                timeout=retry_timeout,
-                                session_id=session_id,
-                            )
-                            async with cache_context as cache_handles:
-                                background_task = None
-                                async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
-                                    requested_uids=requested_uids,
-                                    requested_backends=requested_backends,
-                                    active_adapter=self._get_active_adapter(metadata),
-                                    input_iterator=self._iterate_inference_steps(
-                                        request, requests, session_id, requested_uids, context
-                                    ),
-                                    cache_handles=cache_handles,
-                                    max_length=max_length,
-                                    prioritizer=self._prioritizer,
-                                    points=points,
-                                    quant_type=self.quant_type,
-                                    args_structure=args_structure,
-                                ):
-                                    if can_push:
-                                        if background_task is None:
-                                            background_task = asyncio.create_task(
-                                                self._push_outputs(request, output_tensors[0], step_metadata)
-                                            )
-                                    yield runtime_pb2.ExpertResponse(tensors=output_tensors)
-                        except Exception as retry_e:
-                            logger.error(f"Retry after cleanup also failed: {retry_e}")
-                            raise retry_e
-                    else:
-                        raise e
+                                prioritizer=self._prioritizer,
+                                points=points,
+                                quant_type=self.quant_type,
+                                args_structure=args_structure,
+                            ):
+                                if can_push:
+                                    if background_task is None:
+                                        background_task = asyncio.create_task(
+                                            self._push_outputs(request, output_tensors[0], step_metadata)
+                                        )
+                                yield runtime_pb2.ExpertResponse(tensors=output_tensors)
+                    except Exception as retry_e:
+                        logger.error(f"Retry after cleanup also failed: {retry_e}")
+                        raise retry_e
+                else:
+                    raise e
 
-            finally:
-                if session_id:
-                    self.module_backends[requested_uids[0]].memory_cache.end_session(session_id)
-                self._log_request("rpc_inference.close", requested_uids, context)
+        finally:
+            if session_id:
+                self.module_backends[requested_uids[0]].memory_cache.end_session(session_id)
+            self._log_request("rpc_inference.close", requested_uids, context)
 
     @contextlib.contextmanager
     def _managed_session(self, session_id: str):

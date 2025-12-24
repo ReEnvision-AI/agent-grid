@@ -42,7 +42,7 @@ class MemoryCache:
         self.max_size_bytes = max_size_bytes if max_size_bytes is not None else (2**64 - 1)
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
-        self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
+        self._current_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._pooled_size_bytes = mp.Value(ctypes.c_int64, 0, lock=True)
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
@@ -95,7 +95,8 @@ class MemoryCache:
 
     @current_size_bytes.setter
     def current_size_bytes(self, value: int):
-        self._current_size.value = value
+        with self._current_size.get_lock():
+            self._current_size.value = value
 
     @property
     def enqueued_size_bytes(self) -> int:
@@ -321,7 +322,8 @@ class MemoryCache:
             async with self._wait_for_free_memory(alloc_size, timeout):
                 with self._lock_metadata:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
-                    self.current_size_bytes += alloc_size
+                    with self._current_size.get_lock():
+                        self.current_size_bytes += alloc_size
                     self.handle_counter += len(handles)  # note: this will eventually overflow and it is okay
                     self._allocation_count += 1
                     command_info = {"session_id": session_id} if session_id else None
@@ -376,7 +378,8 @@ class MemoryCache:
 
         with self._lock_metadata:
             self._pipe_send.send((handles, None, None))  # signal runtime to free these handles
-            self.current_size_bytes -= alloc_size
+            with self._current_size.get_lock():
+                self.current_size_bytes -= alloc_size
         self._memory_freed_event.set()
 
     def _wait_until_available(self, allocated_size: int, timeout: Optional[float] = None):
@@ -719,6 +722,13 @@ class MemoryCache:
                         self._pooled_size_bytes.value += tensor_size
 
         # Step 4: Yield tensors
+        missing_handles = [h for h in handles if h not in self._allocated_tensors]
+        if missing_handles:
+            raise CacheHandleMissingError(
+                f"Handles {missing_handles} missing from cache. "
+                "This usually happens when the session times out or is closed by the client "
+                "while a request is being processed."
+            )
         yield tuple(self._allocated_tensors[handle] for handle in handles)
 
     def force_memory_cleanup(self, target_free_bytes: Optional[int] = None) -> int:
@@ -827,4 +837,9 @@ class MemoryCache:
 
 
 class AllocationFailed(Exception):
+    pass
+
+
+class CacheHandleMissingError(Exception):
+    """Raised when attempting to access a cache handle that has been freed."""
     pass
