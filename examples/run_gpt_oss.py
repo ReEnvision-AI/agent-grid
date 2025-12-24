@@ -85,7 +85,7 @@ def generate_smart(model_id: str) -> None:
         params = {
                 "max_new_tokens": 8192,
                 "do_sample": False,
-                "temperature": 0.6,
+                #"temperature": 0.6,
                 "repetition_penalty": 1.2,
                 #"eos_token_id": eos_ids,
                 #"pad_token_id": tokenizer.pad_token_id
