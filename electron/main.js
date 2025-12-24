@@ -51,7 +51,6 @@ function getStore() {
 const MODELS = [
   'Qwen/Qwen2.5-Coder-32B-Instruct',
   'nvidia/Llama-3_3-Nemotron-Super-49B-v1_5',
-  'nvidia/NVIDIA-Nemotron-Nano-12B-v2',
   'unsloth/gpt-oss-20b-BF16'
 ];
 
@@ -539,7 +538,7 @@ function writeRuntimeConfig(settings) {
     token: process.env.HF_TOKEN || null,
     warmup_tokens_interval: settings.warmupTokensInterval || 0,
     quant_type: settings.quantType || 'none',
-    attn_cache_tokens: 128000,
+    attn_cache_tokens: 136192 * 2, // Setting to (context window + new tokens) * 2
     dht_prefix: normalizeDhtPrefix(settings.dhtPrefix),
     throughput: normalizeThroughput(settings.throughput)
   };
