@@ -28,7 +28,7 @@ RUN chown agentgrid:agentgrid /app
 
 # Copy dependency definitions and local dependencies first for caching
 COPY --chown=agentgrid:agentgrid pyproject.toml /app/
-COPY --chown=agentgrid:agentgrid deps/ /app/deps/
+#COPY --chown=agentgrid:agentgrid deps/ /app/deps/
 
 # Copy the rest of the source and config files
 COPY --chown=agentgrid:agentgrid src/ /app/src/

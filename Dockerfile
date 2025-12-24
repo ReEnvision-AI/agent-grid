@@ -21,7 +21,7 @@ COPY src/agentgrid/VERSION /home/agent-grid/src/agentgrid/VERSION
 COPY src/agentgrid/__init__.py /home/agent-grid/src/agentgrid/__init__.py
 
 # This directory is required by pyproject.toml to install the local .whl file.
-COPY deps/ /home/agent-grid/deps/
+#COPY deps/ /home/agent-grid/deps/
 
 # Install core project dependencies
 WORKDIR /home/agent-grid/
