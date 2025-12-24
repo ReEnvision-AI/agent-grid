@@ -65,7 +65,7 @@ done
 
 PORT=${PORT:-31331}
 ALLOC_TIMEOUT=${ALLOC_TIMEOUT:-6000}
-ATTN_CACHE_TOKENS=${ATTN_CACHE_TOKENS:-64000}
+ATTN_CACHE_TOKENS=${ATTN_CACHE_TOKENS:-264000}
 DISK_SPACE=${DISK_SPACE:-120GB}
 INFERENCE_MAX_LENGTH=${INFERENCE_MAX_LENGTH:-136192}
 P2P_FILE=${P2P_FILE:-./dev.id}
@@ -134,7 +134,7 @@ CMD=(
     --port "$PORT"
     --token "$HF_TOKEN"
     --attn_cache_tokens "$ATTN_CACHE_TOKENS"
-    --inference_max_length "$INFERENCE_MAX_LENGTH"
+    #--inference_max_length "$INFERENCE_MAX_LENGTH"
     --identity_path "$P2P_FILE"
     --throughput eval
     --new_swarm

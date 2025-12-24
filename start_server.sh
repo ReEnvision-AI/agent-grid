@@ -44,7 +44,7 @@ done
 PORT=31331
 MAX_LENGTH=72192
 ALLOC_TIMEOUT=6000
-ATTN_CACHE_TOKENS=64000
+ATTN_CACHE_TOKENS=264000
 PUBLIC_IP=$(curl ipinfo.io/ip)
 P2P_FILE='./dev.id'
 DISK_SPACE='120GB'
@@ -62,7 +62,6 @@ python -m agentgrid.cli.run_server \
     --token $HF_TOKEN \
     --identity_path $P2P_FILE \
     --throughput 'eval' \
-    --inference_max_length "${MAX_LENGTH}" \
     --attn_cache_tokens "${ATTN_CACHE_TOKENS}" \
     $MODEL &
     

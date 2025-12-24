@@ -2,6 +2,5 @@
 MODELS=(
     "Qwen/Qwen2.5-Coder-32B-Instruct"
     "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5"
-    "nvidia/NVIDIA-Nemotron-Nano-12B-v2"
     "unsloth/gpt-oss-20b-BF16"
 )
