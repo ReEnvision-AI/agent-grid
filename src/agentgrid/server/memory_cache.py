@@ -22,7 +22,7 @@ import multiprocessing as mp
 import os
 import time
 from collections import OrderedDict
-from typing import AsyncContextManager, Counter, Dict, List, Optional, Sequence, Tuple
+from typing import AsyncContextManager, Counter, Dict, List, Optional, Sequence
 
 import async_timeout
 import torch
@@ -38,12 +38,7 @@ logger = get_logger(__name__)
 class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
-    def __init__(
-        self,
-        max_size_bytes: Optional[int],
-        max_alloc_timeout: Optional[float] = None,
-        model_weight_bytes: Optional[Dict[torch.device, int]] = None,
-    ):
+    def __init__(self, max_size_bytes: Optional[int], max_alloc_timeout: Optional[float] = None):
         self.max_size_bytes = max_size_bytes if max_size_bytes is not None else (2**64 - 1)
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
@@ -59,22 +54,6 @@ class MemoryCache:
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
-
-        # Model weight tracking per device (provided externally or estimated)
-        self._model_weight_bytes: Dict[torch.device, int] = model_weight_bytes or {}
-
-        # Reserved memory for overhead (temporary buffers, fragmentation, allocator overhead)
-        # Default to 20% of max_size_bytes or at least 500MB
-        self._reserved_overhead_bytes = max(
-            int(self.max_size_bytes * 0.20) if self.max_size_bytes != 2**64 - 1 else 500 * 1024 * 1024,
-            500 * 1024 * 1024,  # At least 500MB
-        )
-
-        # Backpressure threshold - when to start rejecting requests
-        self._backpressure_threshold = 0.85  # 85% of allocatable memory
-
-        # Per-device CUDA memory limits (cached)
-        self._cuda_memory_limits: Dict[torch.device, Tuple[int, int]] = {}  # device -> (free, total)
 
         # Initialize CUDA memory pool optimizations
         self._initialize_cuda_memory_pools()
@@ -105,13 +84,13 @@ class MemoryCache:
 
         # Predictive allocation
         self._session_patterns: Dict[str, List[List[TensorDescriptor]]] = {}
+        self._session_pattern_timestamps: Dict[str, float] = {}  # Track when pattern was last used/updated
         self._active_sessions: Dict[str, List[TensorDescriptor]] = {}
+        self._active_session_timestamps: Dict[str, float] = {}  # Track when session was last active
         self._pre_allocated_tensors: Dict[str, List[torch.Tensor]] = {}
         self._pre_allocation_timestamps: Dict[str, float] = {}
         self._pre_allocation_timeout = 300.0  # 5 minutes timeout for pre-allocated tensors
-
-        # Update reserved overhead based on actual model weights
-        self._update_reserved_memory()
+        self._session_timeout = 120.0  # 2 minutes timeout for stale sessions
 
     @property
     def current_size_bytes(self) -> int:
@@ -134,8 +113,7 @@ class MemoryCache:
     def bytes_left(self) -> int:
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
             total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
-            # Account for reserved overhead in the calculation
-            return max(0, self.max_size_bytes - total_used - self._reserved_overhead_bytes)
+            return max(0, self.max_size_bytes - total_used)
 
     @property
     def handle_counter(self) -> int:
@@ -151,14 +129,12 @@ class MemoryCache:
             try:
                 # Enable CUDA memory pool for more efficient memory allocation
                 # This reduces fragmentation and improves allocation speed
-                # Set to 85% to balance block loading with inference headroom
                 for device_id in range(torch.cuda.device_count()):
                     device = torch.device(f'cuda:{device_id}')
                     with torch.cuda.device(device):
-                        # Set memory fraction to 85% to prevent oversubscription during inference
-                        # This leaves 15% headroom for temporary buffers and fragmentation
-                        torch.cuda.set_per_process_memory_fraction(0.85, device_id)
-                        logger.info(f"Initialized CUDA memory pool (85%) for device {device_id}")
+                        # Set memory fraction to prevent oversubscription
+                        torch.cuda.set_per_process_memory_fraction(0.9, device_id)
+                        logger.info(f"Initialized CUDA memory pool for device {device_id}")
 
                 # Clear any existing cached memory
                 torch.cuda.empty_cache()
@@ -166,92 +142,6 @@ class MemoryCache:
 
             except Exception as e:
                 logger.warning(f"Failed to initialize CUDA memory pools: {e}")
-
-    def _get_cuda_memory_info(self, device: torch.device) -> Tuple[int, int]:
-        """Get actual CUDA memory info (free, total) for a device."""
-        if device.type == "cuda":
-            try:
-                free_bytes, total_bytes = torch.cuda.mem_get_info(device.index or 0)
-                self._cuda_memory_limits[device] = (free_bytes, total_bytes)
-                return free_bytes, total_bytes
-            except Exception as e:
-                logger.warning(f"Failed to get CUDA memory info for {device}: {e}")
-        return (2**64 - 1, 2**64 - 1)  # Fallback to unlimited
-
-    def _update_reserved_memory(self):
-        """Update reserved memory based on model weights and overhead."""
-        if torch.cuda.is_available():
-            for device_id in range(torch.cuda.device_count()):
-                device = torch.device(f'cuda:{device_id}')
-                free_cuda, total_cuda = self._get_cuda_memory_info(device)
-
-                # If model weights not provided, estimate based on GPU memory
-                if device not in self._model_weight_bytes:
-                    # Rough estimate: assume model uses ~30% of GPU memory for large models
-                    estimated_model_bytes = int(total_cuda * 0.30)
-                    self._model_weight_bytes[device] = estimated_model_bytes
-                    logger.info(
-                        f"Estimated model weights at {estimated_model_bytes / 1024**3:.2f} GiB for {device}"
-                    )
-
-                logger.debug(
-                    f"Device {device}: model={self._model_weight_bytes.get(device, 0) / 1024**3:.2f} GiB, "
-                    f"reserved_overhead={self._reserved_overhead_bytes / 1024**3:.2f} GiB"
-                )
-        elif torch.backends.mps.is_available():
-            # For MPS devices, we use unified memory so no need to estimate model weights
-            # Model weights share system memory with the cache
-            logger.debug("MPS device detected: using unified memory model")
-
-    def _get_allocatable_memory(self, device: torch.device) -> int:
-        """
-        Get the amount of memory that can actually be allocated for cache tensors.
-        This accounts for model weights, reserved overhead, and actual device memory.
-        For MPS devices, returns a large value since MPS has unified memory.
-        """
-        if device.type != "cuda":
-            # For MPS/CPU, use a large value since they have unified/shared memory
-            # and we can't accurately query allocatable memory
-            return 2**64 - 1
-
-        free_cuda, total_cuda = self._get_cuda_memory_info(device)
-        model_bytes = self._model_weight_bytes.get(device, 0)
-
-        # Allocatable = free_cuda - model_weights - overhead - buffer
-        # The buffer is for concurrent allocations and fragmentation
-        buffer = max(100 * 1024 * 1024, int(total_cuda * 0.05))  # At least 100MB or 5%
-        allocatable = free_cuda - model_bytes - self._reserved_overhead_bytes - buffer
-
-        return max(0, allocatable)
-
-    def _should_apply_backpressure(self, device: torch.device, required_bytes: int) -> bool:
-        """
-        Check if backpressure should be applied based on actual CUDA memory.
-        Returns True if we should reject or delay this allocation.
-        """
-        if device.type != "cuda":
-            return False
-
-        allocatable = self._get_allocatable_memory(device)
-        if required_bytes > allocatable:
-            return True
-
-        # Also check if we're above the backpressure threshold
-        free_cuda, total_cuda = self._get_cuda_memory_info(device)
-        model_bytes = self._model_weight_bytes.get(device, 0)
-        used_by_model_and_cache = total_cuda - free_cuda - model_bytes
-
-        effective_total = total_cuda - model_bytes
-        if effective_total > 0:
-            usage_ratio = used_by_model_and_cache / effective_total
-            if usage_ratio > self._backpressure_threshold:
-                logger.warning(
-                    f"Backpressure: device {device} at {usage_ratio * 100:.1f}% usage "
-                    f"(threshold: {self._backpressure_threshold * 100:.1f}%)"
-                )
-                return True
-
-        return False
 
     def force_garbage_collection(self, aggressive: bool = False) -> int:
         """
@@ -325,7 +215,6 @@ class MemoryCache:
     def ensure_memory_available(self, required_bytes: int, device: Optional[torch.device] = None):
         """
         Proactively evict memory to ensure enough space for allocation.
-        Now includes actual CUDA memory checks, not just accounting.
 
         :param required_bytes: Amount of memory needed for allocation
         :param device: Optional device to check memory for
@@ -333,28 +222,6 @@ class MemoryCache:
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
             total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
 
-        # Check actual CUDA memory availability
-        if device is not None and device.type == "cuda":
-            free_cuda, total_cuda = self._get_cuda_memory_info(device)
-
-            # Apply backpressure if CUDA memory is too low
-            if self._should_apply_backpressure(device, required_bytes):
-                allocatable = self._get_allocatable_memory(device)
-                logger.warning(
-                    f"CUDA backpressure for {device}: need {required_bytes / 1024**2:.2f} MB, "
-                    f"but only ~{allocatable / 1024**2:.2f} MB allocatable (free CUDA: {free_cuda / 1024**2:.2f} MB)"
-                )
-                # Evict more aggressively when under backpressure
-                bytes_to_evict = min(
-                    self._pooled_size_bytes.value,
-                    required_bytes + self._reserved_overhead_bytes,
-                )
-                if bytes_to_evict > 0:
-                    logger.info(f"Backpressure evicting {bytes_to_evict / 1024**2:.2f} MB")
-                    self._evict_memory(bytes_to_evict)
-                    self.force_garbage_collection(aggressive=True)
-
-        # Original accounting-based check
         if total_used + required_bytes > self.max_size_bytes:
             # Calculate how much memory we need to free
             memory_shortfall = (total_used + required_bytes) - self.max_size_bytes
@@ -384,21 +251,6 @@ class MemoryCache:
         assert os.getpid() != self.runtime_pid, "This method must be called from a ConnectionHandler"
         with self._lock_metadata:
             self._pipe_send.send((None, None, {"command": "end_session", "session_id": session_id}))
-
-    def set_model_weight_bytes(self, model_weight_bytes: Dict[torch.device, int]):
-        """
-        Set the model weight bytes for each device. This should be called after
-        the model is loaded to improve memory allocation accuracy.
-
-        :param model_weight_bytes: Dictionary mapping devices to the number of bytes
-                                   occupied by model weights on that device.
-        """
-        assert os.getpid() == self.runtime_pid, "This method must be called from the runtime process"
-        self._model_weight_bytes = model_weight_bytes.copy()
-        logger.info(
-            f"Updated model weight tracking: "
-            + ", ".join(f"{d}: {b / 1024**3:.2f} GiB" for d, b in model_weight_bytes.items())
-        )
 
     @contextlib.asynccontextmanager
     async def allocate_cache(
@@ -770,6 +622,12 @@ class MemoryCache:
             if collected > 0:
                 logger.debug(f"Periodic GC collected {collected} objects")
 
+        # Step 1.75: Periodic cleanup of expired pre-allocations and stale sessions
+        # This ensures pre-allocated tensors for inactive sessions are cleaned up
+        if self._compaction_counter % self._adaptive_compaction_min_interval == 0:
+            self._cleanup_expired_preallocations()
+            self._cleanup_stale_sessions()
+
         # Step 2: Evict memory if cache is over budget
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
             total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
@@ -794,7 +652,10 @@ class MemoryCache:
                     history = self._active_sessions.pop(session_id)
                     patterns = self._session_patterns.setdefault(session_id, [])
                     patterns.append(history)
+                    self._session_pattern_timestamps[session_id] = time.time()  # Update pattern timestamp
                     logger.debug(f"Ended session {session_id}, stored allocation pattern with {len(history)} steps.")
+                # Clean up session timestamp
+                self._active_session_timestamps.pop(session_id, None)
                 if session_id in self._pre_allocated_tensors: # Clean up any leftover pre-allocations
                     for tensor in self._pre_allocated_tensors.pop(session_id):
                         # Return tensor to the free pool
@@ -811,6 +672,7 @@ class MemoryCache:
                 if session_id:
                     session_history = self._active_sessions.setdefault(session_id, [])
                     session_history.extend(recv_data)
+                    self._active_session_timestamps[session_id] = time.time()  # Update session activity timestamp
 
                 for handle, descr in zip(recv_handles, recv_data):
                     reused_tensor = None
@@ -843,9 +705,6 @@ class MemoryCache:
                         with self._pooled_size_bytes.get_lock():
                             self._pooled_size_bytes.value -= tensor_size
                     else:
-                        # Allocate new tensor - note: we can't check CUDA memory here because
-                        # this runs in the forked runtime subprocess where torch.cuda.mem_get_info() fails
-                        # The CUDA memory check is done in allocate_cache() (handler process) instead
                         self._allocated_tensors[handle] = torch.empty(
                             descr.shape, dtype=descr.dtype, device=descr.device
                         )
@@ -960,6 +819,37 @@ class MemoryCache:
                     numel_pool.append(tensor)
                 self._pre_allocation_timestamps.pop(session_id, None)
                 continue
+
+    def _cleanup_stale_sessions(self):
+        """Clean up sessions that have been inactive for too long."""
+        current_time = time.time()
+        stale_sessions = []
+
+        for session_id, timestamp in self._active_session_timestamps.items():
+            if current_time - timestamp > self._session_timeout:
+                stale_sessions.append(session_id)
+
+        for session_id in stale_sessions:
+            logger.warning(f"Cleaning up stale session {session_id}")
+            # Move active session to patterns
+            if session_id in self._active_sessions:
+                history = self._active_sessions.pop(session_id)
+                patterns = self._session_patterns.setdefault(session_id, [])
+                patterns.append(history)
+                logger.debug(f"Stored allocation pattern for stale session {session_id} with {len(history)} steps")
+
+            # Clean up any pre-allocated tensors
+            if session_id in self._pre_allocated_tensors:
+                for tensor in self._pre_allocated_tensors.pop(session_id):
+                    descr = TensorDescriptor.from_tensor(tensor)
+                    device_pool = self._free_pools.setdefault(descr.device, {})
+                    dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
+                    numel_pool = dtype_pool.setdefault(tensor.numel(), [])
+                    numel_pool.append(tensor)
+
+            # Remove timestamp
+            self._active_session_timestamps.pop(session_id, None)
+            self._pre_allocation_timestamps.pop(session_id, None)
 
     def _log_memory_stats(self):
         """Log memory statistics for monitoring purposes."""
