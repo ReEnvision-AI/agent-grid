@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025 ReEnvision AI, LLC. All rights reserved.
+# Copyright (c) 2025-2026 ReEnvision AI, LLC. All rights reserved.
 #
 # This software is the confidential and proprietary information of
 # ReEnvision AI, LLC ("Confidential Information"). You shall not
@@ -71,8 +71,13 @@ class BlockLoadingOutOfMemoryError(RuntimeError):
 def _is_out_of_memory_error(exc: BaseException) -> bool:
     if isinstance(exc, torch.cuda.OutOfMemoryError):
         return True
-    message = str(exc)
-    return "out of memory" in message.lower()
+    message = str(exc).lower()
+    # Be more strict: only treat as OOM if it's clearly about CUDA memory allocation
+    # Avoid false positives from messages about "allocatable memory" or other uses of "memory"
+    if "out of memory" in message:
+        # Check that it's actually about CUDA/GPU memory, not just a message about allocatable bytes
+        return ("cuda" in message or "gpu" in message or "allocated" in message)
+    return False
 
 
 class Server:
@@ -649,7 +654,8 @@ class Server:
                     self.num_blocks,
                     self.attn_cache_bytes / gib,
                 )
-                logger.debug("Original OOM exception: %s", exc.original_exception)
+                # Log original exception at WARNING level to ensure it's visible
+                logger.warning("Original OOM exception: %s: %s", type(exc.original_exception).__name__, exc.original_exception)
 
                 self._clean_memory_and_fds()
                 continue
@@ -837,6 +843,10 @@ class ModuleContainer(threading.Thread):
             if should_validate_reachability:
                 validate_reachability(dht.peer_id)
         except Exception as exc:
+            # Log the actual exception for debugging
+            logger.error(f"Exception during block loading: {type(exc).__name__}: {exc}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             logger.debug("Shutting down backends")
             for backend in blocks.values():
                 backend.shutdown()
